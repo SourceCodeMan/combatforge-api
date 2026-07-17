@@ -3,6 +3,7 @@ import type { Env } from "./env";
 import { nowSec } from "./env";
 import type { Auth } from "./auth";
 import { generateKidNameClamped, validateChosenName } from "./names";
+import { levelProgress } from "./xp";
 
 /**
  * Minimal server-rendered pages so the whole account + device-link loop works end-to-end from
@@ -28,9 +29,13 @@ const page = (title: string, body: string) => `<!doctype html>
   form{background:#1d2026;padding:20px;border-radius:10px;display:flex;flex-direction:column;gap:10px}
   input,select,button{padding:10px;border-radius:6px;border:1px solid #333;background:#12141a;color:#eee;font-size:1rem}
   button{background:#2a6df4;border:none;cursor:pointer;font-weight:600}
+  button.secondary{background:#2a2f3a}
+  button.secondary:hover{background:#343a47}
   .btn-link{display:block;text-align:center;padding:10px;border-radius:6px;background:#2a2f3a;
     color:#eee;text-decoration:none;font-weight:600;margin-top:4px}
   .btn-link:hover{background:#343a47}
+  .account-box{background:#1d2026;border:1px solid #333;border-radius:10px;padding:16px 18px;
+    margin:14px 0;line-height:1.5;font-size:.95rem}
   .divider{text-align:center;color:#6b7280;font-size:.85rem;margin:4px 0}
   .note{color:#9aa3b2;font-size:.9rem;line-height:1.35}
   .err{color:#ff7a70;font-weight:600}
@@ -45,9 +50,12 @@ export function buildPages(buildAuth: BuildAuthFn) {
 
   // `next` is attacker-influenceable (a crafted link's query string) — constrain it to a same-site
   // relative path so it can never become an open redirect to an external phishing page.
+  // Default destination is the account home, NOT /link: only the in-game device-code flow passes
+  // an explicit next=/link, so a plain "Log In" from the website lands on the account page instead
+  // of the (now-confusing) code-entry screen (Tom 2026-07-17).
   const safeNext = (raw: string | undefined): string => {
     if (!raw || !raw.startsWith("/") || raw.startsWith("//") || raw.includes("://")) {
-      return "/link";
+      return "/account";
     }
     return raw;
   };
@@ -159,16 +167,62 @@ export function buildPages(buildAuth: BuildAuthFn) {
       <p class="note">That's your player name for now. When you're old enough, you'll be able to
       choose your own name — it unlocks automatically on your 13th birthday year.</p>
       <p class="note">Write your name and password down somewhere safe (or have a parent keep it).</p>
-      <p><a href="${next}">Linking a game? Enter your code here →</a></p>`));
+      <p><a class="btn-link" href="${next}">Continue →</a></p>`));
+  });
+
+  // ---- account home (the logged-in landing) ----
+  // Every plain login/signup ends here so a signed-in player sees "you're all set", not the
+  // device-code box (Tom 2026-07-17: clicking Log In looped back to the Link page).
+  app.get("/account", async (c) => {
+    const auth = buildAuth(c.env);
+    const session = await auth.api.getSession({ headers: c.req.raw.headers });
+    if (!session) return c.redirect("/login?next=" + encodeURIComponent("/account"));
+
+    const uid = session.user.id;
+    const [user, prof] = await Promise.all([
+      c.env.DB.prepare(`SELECT username, displayUsername, isChild FROM user WHERE id = ?`).bind(uid).first(),
+      c.env.DB.prepare(`SELECT xp_total FROM app_profiles WHERE user_id = ?`).bind(uid).first(),
+    ]);
+    const displayName = (user?.displayUsername as string) ?? (user?.username as string) ?? "Player";
+    const xpTotal = (prof?.xp_total as number) ?? 0;
+    const prog = levelProgress(xpTotal);
+    const okMsg = c.req.query("ok") ?? "";
+
+    return c.html(page("Your account", `
+      <h1>Hi, <span class="ok">${displayName}</span> 👋</h1>
+      ${okMsg ? `<p class="ok">${okMsg}</p>` : ""}
+      <p class="note">You're signed in and ready to play — <b>Level ${prog.level}</b>${
+        prog.next > 0 ? ` (${prog.into}/${prog.next} XP to next level)` : ""}.</p>
+      <div class="account-box">
+        <p><b>To play:</b> open CombatForge and choose <b>ONLINE</b>. If it asks you to LOG IN, it
+        shows a 6-character code — enter it below to connect that device.</p>
+      </div>
+      <a class="btn-link" href="/link">Link a game / enter a code</a>
+      <p class="divider">·</p>
+      <form method="post" action="/logout"><button class="secondary">Log out</button></form>`));
+  });
+
+  app.post("/logout", async (c) => {
+    await authPost(c.env, "/sign-out", {}, c.req.header("Cookie") ?? null);
+    // Clear the cookie regardless and send them back to the login screen.
+    const res = c.redirect("/login");
+    res.headers.set("set-cookie",
+      "better-auth.session_token=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax");
+    return res;
   });
 
   // ---- login ----
   // Most first-time visitors land here FROM the /link redirect (a brand-new player who just got
   // a code in-game and has no account yet) — the "create an account" path needs to read as the
   // obvious next step for them, not a footnote (Tom 2026-07-17: got a code, no clue how to sign up).
-  app.get("/login", (c) => {
+  app.get("/login", async (c) => {
     const err = c.req.query("err") ?? "";
     const next = safeNext(c.req.query("next"));
+    // Already signed in? Don't show a login form — go straight to where they were headed
+    // (their account by default). This is what stops "Log In" from looping back to the code box.
+    const auth = buildAuth(c.env);
+    const session = await auth.api.getSession({ headers: c.req.raw.headers });
+    if (session) return c.redirect(next);
     return c.html(page("Log in", `
       <h1>Log in to CombatForge</h1>
       ${err ? `<p class="err">${err}</p>` : ""}
@@ -212,7 +266,9 @@ export function buildPages(buildAuth: BuildAuthFn) {
         <input class="code" name="userCode" placeholder="ABC123" maxlength="6" required
                autocomplete="off" autocapitalize="characters">
         <button>Approve this game</button>
-      </form>`));
+      </form>
+      <p class="divider">·</p>
+      <p><a href="/account">← Back to your account</a></p>`));
   });
 
   app.post("/link", async (c) => {
@@ -239,8 +295,13 @@ export function buildPages(buildAuth: BuildAuthFn) {
       return c.redirect("/link?err=" + encodeURIComponent(
         "That code didn't work — check it and make sure the game is still waiting."));
     }
-    return c.redirect("/link?ok=" + encodeURIComponent("Game linked! Jump back into CombatForge."));
+    // Land on the account home with a success note — not back on the code box.
+    return passCookies(res, c.redirect("/account?ok=" +
+      encodeURIComponent("Game linked! Jump back into CombatForge and play.")));
   });
+
+  // Bare API root → account (which bounces to login if signed out).
+  app.get("/", (c) => c.redirect("/account"));
 
   return app;
 }
