@@ -22,7 +22,7 @@ database_name = "combatforge_api"
 # Placeholder works for `wrangler dev` (local Miniflare SQLite). For deploy: run
 #   npx wrangler d1 create combatforge_api
 # and paste the real id here.
-database_id = "00000000-0000-0000-0000-000000000000"
+database_id = "aece46a2-de50-4427-9faa-0e0c22746e95"
 
 [vars]
 # The game client's fixed OAuth device-flow client id (validated by the device plugin).
