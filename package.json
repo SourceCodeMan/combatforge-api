@@ -12,7 +12,7 @@
   "dependencies": {
     "better-auth": "^1.6.11",
     "hono": "^4.6.0",
-    "kysely": "^0.27.0",
+    "kysely": "^0.29.3",
     "kysely-d1": "^0.3.0",
     "obscenity": "^0.4.0"
   },
