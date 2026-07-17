@@ -1,0 +1,35 @@
+# combatforge-api — accounts + matchmaking directory + progression + store entitlements
+# for CombatForge (see combatforge repo: docs/multiplayer-plan.md + docs/progression-plan.md).
+#
+# Same stack + conventions as combatforge-bugs. Deploy is manual (Tom runs wrangler login):
+# see README.md for the full runbook.
+
+name = "combatforge-api"
+main = "src/index.ts"
+compatibility_date = "2026-07-01"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = true
+
+# NOTE: top-level `routes` MUST sit above [[d1_databases]] — TOML would otherwise parse it
+# as a field of the D1 table and silently ignore it (same gotcha as combatforge-bugs).
+routes = [
+  { pattern = "api.playcombatforge.com", custom_domain = true }
+]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "combatforge_api"
+# Placeholder works for `wrangler dev` (local Miniflare SQLite). For deploy: run
+#   npx wrangler d1 create combatforge_api
+# and paste the real id here.
+database_id = "00000000-0000-0000-0000-000000000000"
+
+[vars]
+# The game client's fixed OAuth device-flow client id (validated by the device plugin).
+GAME_CLIENT_ID = "combatforge-game"
+# Public base URL of this API (used by Better Auth for absolute URLs).
+PUBLIC_BASE_URL = "https://api.playcombatforge.com"
+
+# Secrets (NOT stored here — set with `npx wrangler secret put <NAME>`):
+#   BETTER_AUTH_SECRET  — long random string; signs sessions/tokens (openssl rand -hex 32)
+#   ADMIN_KEY           — bearer key for /v1/admin/* (provision server keys, promo codes)

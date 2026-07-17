@@ -1,0 +1,25 @@
+{
+  "name": "combatforge-api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "schema:local": "wrangler d1 execute combatforge_api --local --file=./sql/schema.sql && wrangler d1 execute combatforge_api --local --file=./sql/auth-schema.sql && wrangler d1 execute combatforge_api --local --file=./sql/seed.sql",
+    "schema:remote": "wrangler d1 execute combatforge_api --remote --file=./sql/schema.sql && wrangler d1 execute combatforge_api --remote --file=./sql/auth-schema.sql && wrangler d1 execute combatforge_api --remote --file=./sql/seed.sql"
+  },
+  "dependencies": {
+    "better-auth": "^1.6.11",
+    "hono": "^4.6.0",
+    "kysely": "^0.27.0",
+    "kysely-d1": "^0.3.0",
+    "obscenity": "^0.4.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260714.1",
+    "better-sqlite3": "^12.11.1",
+    "typescript": "^5.6.0",
+    "wrangler": "^4.111.0"
+  }
+}
