@@ -38,6 +38,22 @@ const page = (title: string, body: string) => `<!doctype html>
     margin:14px 0;line-height:1.5;font-size:.95rem}
   .divider{text-align:center;color:#6b7280;font-size:.85rem;margin:4px 0}
   .note{color:#9aa3b2;font-size:.9rem;line-height:1.35}
+  /* account dashboard */
+  .level-card{display:flex;align-items:center;gap:16px;background:#1d2026;border:1px solid #333;
+    border-radius:12px;padding:16px 18px;margin:16px 0}
+  .level-badge{flex:none;width:54px;height:54px;border-radius:50%;display:flex;align-items:center;
+    justify-content:center;font-family:'Oswald','Arial Narrow',sans-serif;font-weight:700;
+    font-size:1.5rem;color:#140a03;background:linear-gradient(135deg,#ffb03a,#ff6a1a)}
+  .level-body{flex:1;min-width:0}
+  .level-top{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:7px}
+  .xp-num{color:#9aa3b2;font-size:.85rem}
+  .xp-bar{height:9px;border-radius:5px;background:#12141a;overflow:hidden}
+  .xp-fill{height:100%;border-radius:5px;background:linear-gradient(90deg,#ffb03a,#ff6a1a)}
+  .level-sub{color:#9aa3b2;font-size:.8rem;margin-top:6px}
+  .stat-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;margin:16px 0}
+  .stat{background:#1d2026;border:1px solid #2b2f38;border-radius:9px;padding:12px 10px;text-align:center}
+  .stat-v{font-family:'Oswald','Arial Narrow',sans-serif;font-weight:700;font-size:1.25rem;color:#eee}
+  .stat-l{color:#8b95a2;font-size:.72rem;text-transform:uppercase;letter-spacing:.06em;margin-top:3px}
   .err{color:#ff7a70;font-weight:600}
   .ok{color:#7ce38b;font-weight:600}
   .code{font-family:monospace;font-size:1.6rem;letter-spacing:.35em;text-align:center}
@@ -180,19 +196,65 @@ export function buildPages(buildAuth: BuildAuthFn) {
 
     const uid = session.user.id;
     const [user, prof] = await Promise.all([
-      c.env.DB.prepare(`SELECT username, displayUsername, isChild FROM user WHERE id = ?`).bind(uid).first(),
-      c.env.DB.prepare(`SELECT xp_total FROM app_profiles WHERE user_id = ?`).bind(uid).first(),
+      c.env.DB.prepare(
+        `SELECT username, displayUsername, isChild, turns13On, createdAt FROM user WHERE id = ?`).bind(uid).first(),
+      c.env.DB.prepare(`SELECT * FROM app_profiles WHERE user_id = ?`).bind(uid).first(),
     ]);
     const displayName = (user?.displayUsername as string) ?? (user?.username as string) ?? "Player";
+    const isChild = !!(user?.isChild);
+
+    // Stats (all default to 0 for a brand-new player who hasn't finished a match yet).
     const xpTotal = (prof?.xp_total as number) ?? 0;
+    const playSec = (prof?.playtime_sec as number) ?? 0;
+    const matches = (prof?.matches_played as number) ?? 0;
+    const wins = (prof?.wins as number) ?? 0;
+    const elims = (prof?.eliminations as number) ?? 0;
+    const deaths = (prof?.times_eliminated as number) ?? 0;
+    const tags = (prof?.tags as number) ?? 0;
     const prog = levelProgress(xpTotal);
+
+    const hours = (playSec / 3600);
+    const playLabel = playSec < 60 ? "0h"
+      : hours >= 1 ? `${hours.toFixed(1)}h` : `${Math.round(playSec / 60)}m`;
+    const winRate = matches > 0 ? `${Math.round((wins / matches) * 100)}%` : "—";
+    const kd = deaths > 0 ? (elims / deaths).toFixed(2) : (elims > 0 ? elims.toFixed(2) : "—");
+    const memberSince = user?.createdAt
+      ? new Date(user.createdAt as string).toLocaleDateString("en-US",
+          { year: "numeric", month: "short", day: "numeric" })
+      : "—";
+    const pct = prog.next > 0 ? Math.round((prog.into / prog.next) * 100) : 100;
     const okMsg = c.req.query("ok") ?? "";
+
+    const stat = (label: string, value: string | number) =>
+      `<div class="stat"><div class="stat-v">${value}</div><div class="stat-l">${label}</div></div>`;
 
     return c.html(page("Your account", `
       <h1>Hi, <span class="ok">${displayName}</span> 👋</h1>
       ${okMsg ? `<p class="ok">${okMsg}</p>` : ""}
-      <p class="note">You're signed in and ready to play — <b>Level ${prog.level}</b>${
-        prog.next > 0 ? ` (${prog.into}/${prog.next} XP to next level)` : ""}.</p>
+
+      <div class="level-card">
+        <div class="level-badge">${prog.level}</div>
+        <div class="level-body">
+          <div class="level-top"><b>Level ${prog.level}</b><span class="xp-num">${xpTotal.toLocaleString()} XP</span></div>
+          <div class="xp-bar"><div class="xp-fill" style="width:${pct}%"></div></div>
+          <div class="level-sub">${prog.next > 0 ? `${prog.into.toLocaleString()} / ${prog.next.toLocaleString()} XP to Level ${prog.level + 1}` : "Max level reached"}</div>
+        </div>
+      </div>
+
+      <div class="stat-grid">
+        ${stat("Play time", playLabel)}
+        ${stat("Matches", matches.toLocaleString())}
+        ${stat("Wins", wins.toLocaleString())}
+        ${stat("Win rate", winRate)}
+        ${stat("Eliminations", elims.toLocaleString())}
+        ${stat("E / D", kd)}
+        ${stat("Builder tags", tags.toLocaleString())}
+        ${stat("Member since", memberSince)}
+      </div>
+
+      ${matches === 0 ? `<p class="note">No matches yet — your stats fill in after your first online match.</p>` : ""}
+      ${isChild ? `<p class="note">You can choose your own player name once you turn 13.</p>` : ""}
+
       <div class="account-box">
         <p><b>To play:</b> open CombatForge and choose <b>ONLINE</b>. If it asks you to LOG IN, it
         shows a 6-character code — enter it below to connect that device.</p>
