@@ -4,6 +4,7 @@ import { buildAuth } from "./auth";
 import { buildPages } from "./pages";
 import { serverRoutes, browseRoutes } from "./directory";
 import { reportRoutes } from "./reports";
+import { casualRoutes } from "./casual";
 import { profileRoutes, storeRoutes, adminRoutes } from "./store";
 
 /**
@@ -56,6 +57,7 @@ client.use("*", requireSession);
 client.route("/", browseRoutes);
 client.route("/", profileRoutes);
 client.route("/", storeRoutes);
+client.route("/", casualRoutes);   // /v1/casual-report — honor-system XP for local/listen/offline matches
 app.route("/v1", client);
 
 app.notFound((c) => c.json({ error: "not found" }, 404));
