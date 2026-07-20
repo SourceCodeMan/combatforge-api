@@ -29,6 +29,10 @@ database_id = "aece46a2-de50-4427-9faa-0e0c22746e95"
 GAME_CLIENT_ID = "combatforge-game"
 # Public base URL of this API (used by Better Auth for absolute URLs).
 PUBLIC_BASE_URL = "https://api.playcombatforge.com"
+# Kill switch for /v1/casual-report. The check is FAIL-SAFE (only "1"/"true" enables), so this var
+# must be present and "1" for casual XP to work. Set it to "0" and redeploy the Worker to yank the
+# honor-system endpoint back to server-only instantly — no game client redeploy.
+CASUAL_XP_ENABLED = "1"
 
 # Secrets (NOT stored here — set with `npx wrangler secret put <NAME>`):
 #   BETTER_AUTH_SECRET  — long random string; signs sessions/tokens (openssl rand -hex 32)

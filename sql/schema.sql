@@ -42,6 +42,33 @@ CREATE TABLE IF NOT EXISTS xp_events (
 );
 CREATE INDEX IF NOT EXISTS idx_xp_events_user ON xp_events(user_id, id);
 
+-- ---- casual (local/listen/offline) XP: idempotency root + daily-cap ledger ----
+-- Casual reports deliberately never write a matches row (fleet-only), so they had NO idempotency
+-- root: the old SELECT-then-write dedupe let N concurrent posts of one matchId all pass and each
+-- bump app_profiles, breaking the "pure projection" contract above. This table is that root — the
+-- UNIQUE PK is the only check the DB itself can arbitrate under concurrency.
+CREATE TABLE IF NOT EXISTS casual_reports (
+  user_id    TEXT NOT NULL,
+  match_id   TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (user_id, match_id)
+);
+
+-- Per-user, per-day claimed casual XP. Exists so the cap can be an ATOMIC CLAIM (one conditional
+-- UPDATE) instead of a SUM()-then-write race where every concurrent request reads the same total.
+-- last_grant holds what the most recent claim won: SQLite evaluates all SET expressions against the
+-- PRE-update row, so `MIN(cap, used + want) - used` is exact even under contention.
+-- day_start is NOT UTC midnight — see CASUAL_DAY_RESET_OFFSET_SEC in src/casual.ts.
+-- Full casual rollback is now THREE deletes: xp_events (source LIKE 'casual_%'), casual_reports,
+-- casual_daily_xp — plus a rebuild of app_profiles from the ledger.
+CREATE TABLE IF NOT EXISTS casual_daily_xp (
+  user_id    TEXT NOT NULL,
+  day_start  INTEGER NOT NULL,
+  used       INTEGER NOT NULL DEFAULT 0,
+  last_grant INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (user_id, day_start)
+);
+
 -- ---- match history (idempotency root: match_id PK — a re-sent report can never double-grant) ----
 CREATE TABLE IF NOT EXISTS matches (
   match_id     TEXT PRIMARY KEY,
