@@ -44,11 +44,15 @@ export function computeXpEvents(s: PlayerStats, isFirstMatchOfDay: boolean): XpE
   return events;
 }
 
-/** Soft-exponential curve, cap 50: cost(L→L+1) = 600 × 1.06^L rounded to 50s. */
+/** Soft-exponential curve, cap 50. Playtest 2026-08-06: flat 250 for first 15 levels
+ *  (one completed match = at least one level); above 15, half the original curve
+ *  (base 600 → 300) = double the overall rate. */
 export const LEVEL_CAP = 50;
 
 export function costForLevel(level: number): number {
-  return Math.round((600 * Math.pow(1.06, level)) / 50) * 50;
+  // First 15 levels cost a flat 250 — completion bonus alone is 250 XP.
+  if (level <= 15) return 250;
+  return Math.round((300 * Math.pow(1.06, level)) / 50) * 50;
 }
 
 export function levelForXp(xpTotal: number): number {
