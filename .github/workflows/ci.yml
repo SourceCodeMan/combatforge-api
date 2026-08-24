@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+      - "release/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  api:
+    name: Type, schema, routes, and Worker smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CI_BASE_REF: ${{ github.event.pull_request.base.sha }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install locked dependencies
+        run: npm ci
+
+      - name: Check changed-file whitespace
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if [[ -n "${BASE_SHA:-}" && ! "$BASE_SHA" =~ ^0+$ ]]; then
+            git diff --check "$BASE_SHA...HEAD"
+          else
+            git show --check --format= HEAD
+          fi
+
+      - name: Run deterministic API checks
+        run: npm test
+
+      - name: Run local Worker and D1 end-to-end smoke
+        run: npm run ci:worker

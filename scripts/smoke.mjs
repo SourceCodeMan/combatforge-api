@@ -1,6 +1,6 @@
 // End-to-end smoke test against a local `wrangler dev` (http://127.0.0.1:8787).
 // Exercises the EXACT flows the game + fleet will use:
-//   admin provision -> server register/heartbeat -> adult signup -> child signup ->
+//   admin provision -> server register/heartbeat -> 13+ signup -> under-13 rejection ->
 //   device-link (code -> approve -> token) -> Bearer profile/servers/quickplay ->
 //   HMAC match-report (XP grant) -> duplicate report (idempotent) -> promo redeem -> store.
 // Usage:  node scripts/smoke.mjs   (requires: npm run schema:local, then npm run dev with
@@ -8,7 +8,7 @@
 import { createHmac } from "node:crypto";
 
 const BASE = process.env.SMOKE_BASE ?? "http://127.0.0.1:8787";
-const ADMIN_KEY = process.env.SMOKE_ADMIN_KEY ?? "dev-admin-key";
+const ADMIN_KEY = process.env.SMOKE_ADMIN_KEY ?? "dev-admin-key-for-smoke-only-32chars";
 
 let failures = 0;
 const check = (name, cond, detail = "") => {
@@ -23,6 +23,8 @@ async function main() {
   {
     const r = await j(await fetch(`${BASE}/healthz`));
     check("healthz", r.status === 200 && r.body.ok === true, JSON.stringify(r.body));
+    check("security headers", (r.headers.get("content-security-policy") ?? "").includes("default-src 'self'"),
+      `csp=${r.headers.get("content-security-policy")}`);
   }
 
   // 1. admin: provision a fleet server key
@@ -51,7 +53,7 @@ async function main() {
     const r = await j(await fetch(`${BASE}/v1/servers/register`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${serverKey}` },
-      body: JSON.stringify({ port: 7777, netProtocol: 4, map: "WAREHOUSE", mode: "Skirmish", maxPlayers: 12 }),
+      body: JSON.stringify({ port: 7777, netProtocol: 20, map: "WAREHOUSE", mode: "Skirmish", maxPlayers: 12 }),
     }));
     check("server register", r.status === 200 && r.body.ok, JSON.stringify(r.body));
     const hb = await j(await fetch(`${BASE}/v1/servers/heartbeat`, {
@@ -66,7 +68,7 @@ async function main() {
   const adultName = "SmokeAdult" + Math.floor(Math.random() * 900 + 100);
   let adultCookie = "";
   {
-    const form = new URLSearchParams({ birthYear: "1990", username: adultName, password: "hunter2hunter2" });
+    const form = new URLSearchParams({ birthDate: "1990-06-15", username: adultName, password: "hunter2hunter2" });
     const r = await fetch(`${BASE}/signup`, { method: "POST", body: form, redirect: "manual" });
     adultCookie = (r.headers.get("set-cookie") ?? "").split(";")[0];
     check("adult signup sets session", r.status === 302 && adultCookie.length > 5,
@@ -75,20 +77,37 @@ async function main() {
 
   // 3b. filtered name rejected
   {
-    const form = new URLSearchParams({ birthYear: "1990", username: "admin_fuck", password: "hunter2hunter2" });
+    const form = new URLSearchParams({ birthDate: "1990-06-15", username: "admin_fuck", password: "hunter2hunter2" });
     const r = await fetch(`${BASE}/signup`, { method: "POST", body: form, redirect: "manual" });
     const loc = r.headers.get("location") ?? "";
     check("bad name rejected", loc.includes("err="), `location=${loc}`);
   }
 
-  // 3c. child signup: generated name + isChild stamped
+  // 3c. under-13 signup is rejected before an account/session is created
   {
-    const year = new Date().getUTCFullYear() - 9; // a 9-year-old
-    const form = new URLSearchParams({ birthYear: String(year), username: "ignored", password: "kidpassword1" });
+    const year = new Date().getUTCFullYear() - 9;
+    const form = new URLSearchParams({ birthDate: `${year}-06-15`, username: "TooYoungPlayer", password: "kidpassword1" });
     const r = await fetch(`${BASE}/signup`, { method: "POST", body: form, redirect: "manual" });
     const loc = r.headers.get("location") ?? "";
-    check("child signup -> welcome-kid + generated name", r.status === 302 && loc.includes("welcome-kid"),
+    check("under-13 signup rejected", r.status === 302 && loc.includes("err=") && !(r.headers.get("set-cookie") ?? ""),
       `status=${r.status} loc=${loc}`);
+  }
+
+  // 3d. reflected query strings are escaped, not interpreted as HTML.
+  {
+    const r = await fetch(`${BASE}/login?err=${encodeURIComponent('<img src=x onerror=alert(1)>')}`);
+    const html = await r.text();
+    check("login error HTML escaped", !html.includes("<img src=x") && html.includes("&lt;img"), html.slice(0, 200));
+  }
+
+  // A second account is used to prove install identities cannot be stolen and promo limits are per claim.
+  const secondName = "SmokeSecond" + Math.floor(Math.random() * 900 + 100);
+  let secondCookie = "";
+  {
+    const form = new URLSearchParams({ birthDate: "1991-03-20", username: secondName, password: "hunter2hunter2" });
+    const r = await fetch(`${BASE}/signup`, { method: "POST", body: form, redirect: "manual" });
+    secondCookie = (r.headers.get("set-cookie") ?? "").split(";")[0];
+    check("second account signup", r.status === 302 && secondCookie.length > 5, `status=${r.status}`);
   }
 
   // 4. device-link flow (the game's login): code -> approve (web session) -> token poll
@@ -135,7 +154,7 @@ async function main() {
     const servers = await j(await fetch(`${BASE}/v1/servers`, { headers: gameHeaders }));
     check("server browser list", servers.status === 200 && servers.body.servers?.length >= 1,
       JSON.stringify(servers.body));
-    const qp = await j(await fetch(`${BASE}/v1/quickplay?netProtocol=4`, { headers: gameHeaders }));
+    const qp = await j(await fetch(`${BASE}/v1/quickplay?netProtocol=20`, { headers: gameHeaders }));
     check("quickplay finds the server", qp.status === 200 && qp.body.server?.port === 7777,
       JSON.stringify(qp.body));
     const guid = "a".repeat(40);
@@ -144,13 +163,18 @@ async function main() {
       body: JSON.stringify({ guidHash: guid }),
     }));
     check("identity link", link.status === 200 && link.body.ok, JSON.stringify(link.body));
+    const steal = await j(await fetch(`${BASE}/v1/identities/link`, {
+      method: "POST", headers: { Cookie: secondCookie, "Content-Type": "application/json" },
+      body: JSON.stringify({ guidHash: guid }),
+    }));
+    check("identity takeover rejected", steal.status === 409, JSON.stringify(steal.body));
   }
 
   // 6. match report (fleet, HMAC) -> XP grant; then duplicate -> idempotent
   {
     const report = {
       matchId: "smoke-" + Date.now(), mode: "Skirmish", map: "WAREHOUSE",
-      endedAt: Math.floor(Date.now() / 1000), durationSec: 700, winnerTeam: 0, netProtocol: 4,
+      endedAt: Math.floor(Date.now() / 1000), durationSec: 700, winnerTeam: 0, netProtocol: 20,
       players: [
         { guidHash: "a".repeat(40), team: 0, elims: 7, timesElim: 3, score: 9, tags: 7,
           objective: 2, builder: 12, completed: true },
@@ -200,7 +224,13 @@ async function main() {
       method: "POST", headers: { ...gameHeaders, "Content-Type": "application/json" },
       body: JSON.stringify({ code: mint.body.code }),
     }));
-    check("promo single-use enforced", again.status === 410, `status=${again.status}`);
+    check("same-user promo retry idempotent", again.status === 200 && again.body.alreadyRedeemed === true,
+      JSON.stringify(again.body));
+    const other = await j(await fetch(`${BASE}/v1/promo/redeem`, {
+      method: "POST", headers: { Cookie: secondCookie, "Content-Type": "application/json" },
+      body: JSON.stringify({ code: mint.body.code }),
+    }));
+    check("promo max-use enforced for another user", other.status === 410, JSON.stringify(other.body));
     const store = await j(await fetch(`${BASE}/v1/store`, { headers: gameHeaders }));
     const pack = store.body.packs?.find((p) => p.sku === "all_access");
     check("store shows owned pack", store.status === 200 && pack?.owned === true,

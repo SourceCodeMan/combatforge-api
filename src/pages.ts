@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import type { Env } from "./env";
 import { nowSec } from "./env";
 import type { Auth } from "./auth";
-import { generateKidNameClamped, validateChosenName } from "./names";
+import { validateChosenName } from "./names";
 import { levelProgress } from "./xp";
 
 /**
@@ -10,18 +10,22 @@ import { levelProgress } from "./xp";
  * day one. The real playcombatforge.com styling can replace these later — every form just talks
  * to the standard Better Auth endpoints, so a prettier front-end is a drop-in.
  *
- * Age-gate posture (COPPA, docs/multiplayer-plan.md §5 + Tom 2026-07-17):
- *  - Neutral birth-year picker. We store only isChild + turns13On (the derived unlock date).
- *  - Under-13: NO email field, name is GENERATED, with a friendly note that they can pick their
- *    own name once they're old enough (rename auto-unlocks on turns13On).
- *  - 13+: choose a username (validated + filtered), optional email later.
+ * Release posture: accounts are 13+ only. The signup form uses a neutral birth-date gate, rejects
+ * under-13 requests before Better Auth is called, and never stores the submitted birth date.
  */
 
 type BuildAuthFn = (env: Env) => Auth;
 
+export const escapeHtml = (value: unknown): string => String(value ?? "")
+  .replaceAll("&", "&amp;")
+  .replaceAll("<", "&lt;")
+  .replaceAll(">", "&gt;")
+  .replaceAll('"', "&quot;")
+  .replaceAll("'", "&#39;");
+
 const page = (title: string, body: string) => `<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>${title} — CombatForge</title>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${escapeHtml(title)} — CombatForge</title>
 <style>
   body{font-family:system-ui,sans-serif;background:#14161a;color:#eee;display:flex;justify-content:center;padding:40px 16px}
   main{max-width:420px;width:100%}
@@ -57,7 +61,13 @@ const page = (title: string, body: string) => `<!doctype html>
   .err{color:#ff7a70;font-weight:600}
   .ok{color:#7ce38b;font-weight:600}
   .code{font-family:monospace;font-size:1.6rem;letter-spacing:.35em;text-align:center}
-</style></head><body><main>${body}</main></body></html>`;
+  footer{margin-top:24px;padding-top:16px;border-top:1px solid #2b2f38;color:#9aa3b2;font-size:.8rem}
+  footer a{margin-right:12px}
+</style></head><body><main>${body}<footer>
+  <a href="https://playcombatforge.com/privacy.html">Privacy</a>
+  <a href="https://playcombatforge.com/eula.html">EULA</a>
+  <a href="https://playcombatforge.com/early-access-faq.html">Early Access FAQ</a>
+</footer></main></body></html>`;
 
 export function buildPages(buildAuth: BuildAuthFn) {
   const app = new Hono<{ Bindings: Env }>();
@@ -70,11 +80,28 @@ export function buildPages(buildAuth: BuildAuthFn) {
   // an explicit next=/link, so a plain "Log In" from the website lands on the account page instead
   // of the (now-confusing) code-entry screen (Tom 2026-07-17).
   const safeNext = (raw: string | undefined): string => {
-    if (!raw || !raw.startsWith("/") || raw.startsWith("//") || raw.includes("://")) {
+    if (!raw || !raw.startsWith("/") || raw.startsWith("//") || raw.includes("\\") ||
+        raw.includes("://") || /[\u0000-\u001f\u007f]/.test(raw)) {
       return "/account";
     }
     return raw;
   };
+
+  const parseBirthDate = (raw: unknown): Date | null => {
+    const value = String(raw ?? "");
+    const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+    if (!match) return null;
+    const year = Number(match[1]);
+    const month = Number(match[2]);
+    const day = Number(match[3]);
+    const date = new Date(Date.UTC(year, month - 1, day));
+    if (date.getUTCFullYear() !== year || date.getUTCMonth() !== month - 1 ||
+        date.getUTCDate() !== day) return null;
+    return date;
+  };
+
+  const ageCutoff = (now: Date): Date =>
+    new Date(Date.UTC(now.getUTCFullYear() - 13, now.getUTCMonth(), now.getUTCDate()));
 
   // ---- helpers: forward form posts as JSON to the stable Better Auth endpoints ----
   const authPost = async (env: Env, path: string, body: unknown, cookie: string | null) => {
@@ -103,21 +130,22 @@ export function buildPages(buildAuth: BuildAuthFn) {
   app.get("/signup", (c) => {
     const err = c.req.query("err") ?? "";
     const next = safeNext(c.req.query("next"));
-    const year = new Date().getUTCFullYear();
-    const opts = Array.from({ length: 90 }, (_, i) => `<option>${year - i}</option>`).join("");
+    const now = new Date();
+    const maxBirthDate = ageCutoff(now).toISOString().slice(0, 10);
+    const minBirthDate = new Date(Date.UTC(now.getUTCFullYear() - 100, now.getUTCMonth(), now.getUTCDate()))
+      .toISOString().slice(0, 10);
     return c.html(page("Create account", `
       <h1>Create your CombatForge account</h1>
-      ${err ? `<p class="err">${err}</p>` : ""}
+      ${err ? `<p class="err">${escapeHtml(err)}</p>` : ""}
       <form method="post" action="/signup?next=${encodeURIComponent(next)}">
-        <label>Birth year <span class="note">(for account setup only)</span></label>
-        <select name="birthYear" required>${opts}</select>
-        <label>Pick a player name <span class="note">(3-16 letters/numbers/_; younger players get a fun generated name)</span></label>
-        <input name="username" placeholder="player name" maxlength="16">
+        <label>Date of birth <span class="note">(age check only; it is not stored)</span></label>
+        <input name="birthDate" type="date" min="${minBirthDate}" max="${maxBirthDate}" required>
+        <label>Pick a player name <span class="note">(3-16 letters/numbers/_)</span></label>
+        <input name="username" placeholder="player name" maxlength="16" required>
         <label>Password</label>
         <input name="password" type="password" minlength="8" required>
         <button>Create account</button>
-        <p class="note">No email needed. Younger players: we'll pick your name for now —
-        you can choose your own when you're old enough!</p>
+        <p class="note">No email needed. CombatForge accounts are currently available to players age 13 and older.</p>
       </form>
       <p><a href="/login?next=${encodeURIComponent(next)}">Already have an account? Log in</a></p>`));
   });
@@ -125,27 +153,23 @@ export function buildPages(buildAuth: BuildAuthFn) {
   app.post("/signup", async (c) => {
     const form = await c.req.parseBody();
     const next = safeNext(c.req.query("next"));
-    const birthYear = Number(form["birthYear"] ?? 0);
+    const birthDate = parseBirthDate(form["birthDate"]);
     const password = String(form["password"] ?? "");
-    const nowYear = new Date().getUTCFullYear();
-    if (!birthYear || birthYear < nowYear - 100 || birthYear > nowYear) {
-      return c.redirect("/signup?next=" + encodeURIComponent(next) + "&err=" + encodeURIComponent("Pick your birth year."));
+    const now = new Date();
+    const oldestAllowed = new Date(Date.UTC(now.getUTCFullYear() - 100, now.getUTCMonth(), now.getUTCDate()));
+    if (!birthDate || birthDate < oldestAllowed || birthDate > now) {
+      return c.redirect("/signup?next=" + encodeURIComponent(next) + "&err=" + encodeURIComponent("Enter a valid date of birth."));
     }
-    // Neutral age gate: conservative — treat as under 13 until the year they COULD be 13 has passed.
-    const age = nowYear - birthYear;
-    const isChild = age < 13;
 
     const errRedirect = (msg: string) =>
       c.redirect(`/signup?next=${encodeURIComponent(next)}&err=${encodeURIComponent(msg)}`);
 
-    let username: string;
-    if (isChild) {
-      username = generateKidNameClamped();
-    } else {
-      const v = validateChosenName(String(form["username"] ?? ""));
-      if (!v.ok) return errRedirect(v.reason);
-      username = v.name;
+    if (birthDate > ageCutoff(now)) {
+      return errRedirect("CombatForge accounts are currently for players age 13 and older.");
     }
+    const v = validateChosenName(String(form["username"] ?? ""));
+    if (!v.ok) return errRedirect(v.reason);
+    const username = v.name;
     if (password.length < 8) {
       return errRedirect("Password must be at least 8 characters.");
     }
@@ -162,29 +186,11 @@ export function buildPages(buildAuth: BuildAuthFn) {
       return errRedirect(msg);
     }
 
-    // Stamp the child flags server-side (additionalFields are input:false — never client-settable).
-    if (isChild) {
-      const turns13 = `${birthYear + 13}-01-01`; // conservative: unlocks Jan 1 of their 13th year
-      await c.env.DB.prepare(
-        `UPDATE user SET isChild = 1, turns13On = ? WHERE username = ?`).bind(turns13, username).run();
-    }
-
-    const done = c.redirect(isChild
-      ? `/welcome-kid?name=${encodeURIComponent(username)}&next=${encodeURIComponent(next)}`
-      : next);
+    const done = c.redirect(next);
     return passCookies(res, done);
   });
 
-  app.get("/welcome-kid", (c) => {
-    const name = c.req.query("name") ?? "Player";
-    const next = safeNext(c.req.query("next"));
-    return c.html(page("Welcome!", `
-      <h1>Welcome, <span class="ok">${name}</span>! 🎉</h1>
-      <p class="note">That's your player name for now. When you're old enough, you'll be able to
-      choose your own name — it unlocks automatically on your 13th birthday year.</p>
-      <p class="note">Write your name and password down somewhere safe (or have a parent keep it).</p>
-      <p><a class="btn-link" href="${next}">Continue →</a></p>`));
-  });
+  app.get("/welcome-kid", (c) => c.redirect("/signup"));
 
   // ---- account home (the logged-in landing) ----
   // Every plain login/signup ends here so a signed-in player sees "you're all set", not the
@@ -202,6 +208,12 @@ export function buildPages(buildAuth: BuildAuthFn) {
     ]);
     const displayName = (user?.displayUsername as string) ?? (user?.username as string) ?? "Player";
     const isChild = !!(user?.isChild);
+    if (isChild) {
+      return c.html(page("Account unavailable", `
+        <h1>This account is unavailable</h1>
+        <p class="err">CombatForge accounts are currently for players age 13 and older.</p>
+        <form method="post" action="/logout"><button class="secondary">Log out</button></form>`), 403);
+    }
 
     // Stats (all default to 0 for a brand-new player who hasn't finished a match yet).
     const xpTotal = (prof?.xp_total as number) ?? 0;
@@ -211,6 +223,7 @@ export function buildPages(buildAuth: BuildAuthFn) {
     const elims = (prof?.eliminations as number) ?? 0;
     const deaths = (prof?.times_eliminated as number) ?? 0;
     const tags = (prof?.tags as number) ?? 0;
+    const builder = (prof?.builder as number) ?? 0;
     const prog = levelProgress(xpTotal);
 
     const hours = (playSec / 3600);
@@ -226,11 +239,11 @@ export function buildPages(buildAuth: BuildAuthFn) {
     const okMsg = c.req.query("ok") ?? "";
 
     const stat = (label: string, value: string | number) =>
-      `<div class="stat"><div class="stat-v">${value}</div><div class="stat-l">${label}</div></div>`;
+      `<div class="stat"><div class="stat-v">${escapeHtml(value)}</div><div class="stat-l">${escapeHtml(label)}</div></div>`;
 
     return c.html(page("Your account", `
-      <h1>Hi, <span class="ok">${displayName}</span> 👋</h1>
-      ${okMsg ? `<p class="ok">${okMsg}</p>` : ""}
+      <h1>Hi, <span class="ok">${escapeHtml(displayName)}</span> 👋</h1>
+      ${okMsg ? `<p class="ok">${escapeHtml(okMsg)}</p>` : ""}
 
       <div class="level-card">
         <div class="level-badge">${prog.level}</div>
@@ -248,13 +261,12 @@ export function buildPages(buildAuth: BuildAuthFn) {
         ${stat("Win rate", winRate)}
         ${stat("Eliminations", elims.toLocaleString())}
         ${stat("E / D", kd)}
-        ${stat("Builder tags", tags.toLocaleString())}
+        ${stat("Tags", tags.toLocaleString())}
+        ${stat("Builder pieces", builder.toLocaleString())}
         ${stat("Member since", memberSince)}
       </div>
 
       ${matches === 0 ? `<p class="note">No matches yet — your stats fill in after your first online match.</p>` : ""}
-      ${isChild ? `<p class="note">You can choose your own player name once you turn 13.</p>` : ""}
-
       <div class="account-box">
         <p><b>To play:</b> open CombatForge and choose <b>ONLINE</b>. If it asks you to LOG IN, it
         shows a 6-character code — enter it below to connect that device.</p>
@@ -287,7 +299,7 @@ export function buildPages(buildAuth: BuildAuthFn) {
     if (session) return c.redirect(next);
     return c.html(page("Log in", `
       <h1>Log in to CombatForge</h1>
-      ${err ? `<p class="err">${err}</p>` : ""}
+      ${err ? `<p class="err">${escapeHtml(err)}</p>` : ""}
       <a class="btn-link" href="/signup?next=${encodeURIComponent(next)}">New here? Create a free account — takes 30 seconds</a>
       <p class="divider">— or, if you already have an account —</p>
       <form method="post" action="/login?next=${encodeURIComponent(next)}">
@@ -300,8 +312,15 @@ export function buildPages(buildAuth: BuildAuthFn) {
   app.post("/login", async (c) => {
     const form = await c.req.parseBody();
     const next = safeNext(c.req.query("next"));
+    const submittedUsername = String(form["username"] ?? "").trim();
+    const restricted = await c.env.DB.prepare(
+      `SELECT isChild FROM user WHERE username = ? COLLATE NOCASE`).bind(submittedUsername).first();
+    if (restricted?.isChild) {
+      return c.redirect(`/login?next=${encodeURIComponent(next)}&err=` +
+        encodeURIComponent("CombatForge accounts are currently for players age 13 and older."));
+    }
     const res = await authPost(c.env, "/sign-in/username", {
-      username: String(form["username"] ?? ""), password: String(form["password"] ?? ""),
+      username: submittedUsername, password: String(form["password"] ?? ""),
     }, null);
     if (!res.ok) {
       return c.redirect(`/login?next=${encodeURIComponent(next)}&err=` + encodeURIComponent("Wrong name or password."));
@@ -316,14 +335,17 @@ export function buildPages(buildAuth: BuildAuthFn) {
     const auth = buildAuth(c.env);
     const session = await auth.api.getSession({ headers: c.req.raw.headers });
     if (!session) return c.redirect("/login?next=" + encodeURIComponent("/link"));
+    const restricted = await c.env.DB.prepare(
+      `SELECT isChild FROM user WHERE id = ?`).bind(session.user.id).first();
+    if (restricted?.isChild) return c.redirect("/account");
     const err = c.req.query("err") ?? "";
     const okMsg = c.req.query("ok") ?? "";
     return c.html(page("Link your game", `
       <h1>Link your game</h1>
       <p class="note">Start CombatForge, choose <b>LOG IN</b>, and type the 6-character code it
       shows you here.</p>
-      ${err ? `<p class="err">${err}</p>` : ""}
-      ${okMsg ? `<p class="ok">${okMsg}</p>` : ""}
+      ${err ? `<p class="err">${escapeHtml(err)}</p>` : ""}
+      ${okMsg ? `<p class="ok">${escapeHtml(okMsg)}</p>` : ""}
       <form method="post" action="/link">
         <input class="code" name="userCode" placeholder="ABC123" maxlength="6" required
                autocomplete="off" autocapitalize="characters">

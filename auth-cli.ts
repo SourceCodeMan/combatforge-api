@@ -12,6 +12,7 @@ export const auth = betterAuth({
   // In-memory sqlite ONLY for CLI introspection — runtime uses D1 (src/auth.ts).
   database: new Database(":memory:"),
   emailAndPassword: { enabled: true, requireEmailVerification: false, minPasswordLength: 8 },
+  session: { expiresIn: 60 * 60 * 24 * 30, updateAge: 60 * 60 * 24 },
   user: {
     additionalFields: {
       isChild: { type: "boolean", defaultValue: false, input: false },

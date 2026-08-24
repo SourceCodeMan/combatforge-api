@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS app_profiles (
   eliminations     INTEGER NOT NULL DEFAULT 0,
   times_eliminated INTEGER NOT NULL DEFAULT 0,
   tags             INTEGER NOT NULL DEFAULT 0,
+  builder          INTEGER NOT NULL DEFAULT 0,
   per_mode         TEXT NOT NULL DEFAULT '{}',    -- JSON: per-mode stat rollups
   last_event_id    INTEGER NOT NULL DEFAULT 0,    -- projection watermark
   updated_at       INTEGER NOT NULL DEFAULT 0
@@ -48,9 +49,12 @@ CREATE INDEX IF NOT EXISTS idx_xp_events_user ON xp_events(user_id, id);
 -- bump app_profiles, breaking the "pure projection" contract above. This table is that root — the
 -- UNIQUE PK is the only check the DB itself can arbitrate under concurrency.
 CREATE TABLE IF NOT EXISTS casual_reports (
-  user_id    TEXT NOT NULL,
-  match_id   TEXT NOT NULL,
-  created_at INTEGER NOT NULL,
+  user_id          TEXT NOT NULL,
+  match_id         TEXT NOT NULL,
+  created_at       INTEGER NOT NULL,
+  processing_token TEXT,
+  processed_at     INTEGER,
+  granted          INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (user_id, match_id)
 );
 
@@ -81,7 +85,19 @@ CREATE TABLE IF NOT EXISTS matches (
   duration_sec INTEGER NOT NULL,
   winner_team  INTEGER NOT NULL,                  -- 0/1, 255 = draw/none
   net_protocol INTEGER NOT NULL,
-  raw          TEXT NOT NULL                      -- full report JSON (replay source)
+  raw          TEXT NOT NULL,                     -- full report JSON (replay source)
+  processing_token TEXT,                          -- owns the all-or-nothing D1 processing batch
+  processed_at INTEGER
+);
+
+-- Atomic first-match-of-day claim. The unique key, rather than a read-then-write query against
+-- xp_events, decides which concurrent match receives the daily bonus.
+CREATE TABLE IF NOT EXISTS daily_bonus_claims (
+  user_id    TEXT NOT NULL,
+  day_start  INTEGER NOT NULL,
+  match_id   TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (user_id, day_start)
 );
 
 CREATE TABLE IF NOT EXISTS match_players (
@@ -139,6 +155,17 @@ CREATE TABLE IF NOT EXISTS promo_codes (
   expires_at     INTEGER,                         -- NULL = never
   created_at     INTEGER NOT NULL,
   note           TEXT
+);
+
+-- Durable per-user redemption record. claim_token ties a newly inserted redemption to the same
+-- transactional batch that increments promo_codes.uses and grants the entitlement.
+CREATE TABLE IF NOT EXISTS promo_redemptions (
+  code           TEXT NOT NULL,
+  user_id        TEXT NOT NULL,
+  entitlement_id TEXT NOT NULL,
+  redeemed_at    INTEGER NOT NULL,
+  claim_token    TEXT NOT NULL UNIQUE,
+  PRIMARY KEY (code, user_id)
 );
 
 -- ---- dedicated fleet: server identities + live directory ----

@@ -5,26 +5,27 @@ progression XP ledger, and store entitlements for **CombatForge** — a Cloudfla
 same stack as `combatforge-bugs`. Design docs live in the game repo:
 `combatforge/docs/multiplayer-plan.md` + `docs/progression-plan.md`.
 
-## What's implemented (all smoke-tested end-to-end — `scripts/smoke.mjs`, 25/25 passing)
+## What's implemented
 
 | Area | Details |
 |---|---|
-| **Accounts** | Better Auth ≥1.6.11 on D1. Age-gated signup: 13+ pick a filtered username; **under-13 get a generated name** (SwiftFalcon42-style), zero contact info collected, and a `turns13On` date that will auto-unlock renaming (COPPA posture per plan §5). |
+| **Accounts** | Better Auth ≥1.6.11 on D1. Accounts are currently **13+ only**: a neutral birth-date screen rejects under-13 signup before account creation and never stores the submitted birth date. Direct Better Auth signup bypasses are blocked. |
 | **Device-link login** | RFC 8628: game POSTs `/api/auth/device/code` → shows 6-char code → player approves at **`/link`** in a browser (claim + approve, post-CVE two-step) → game polls `/api/auth/device/token` → long-lived session token used as `Authorization: Bearer`. No password field ever renders in UE. |
 | **Server directory** | Fleet instances auth with per-instance keys (`/v1/admin/servers` mints them; SHA-256 stored). `POST /v1/servers/register`, `/heartbeat` (10s), stale after 30s. Clients: `GET /v1/servers` (browser), `/v1/quickplay?netProtocol=N` (fullest non-full), `/v1/join/:code` (private matches). Join addr = Worker-observed IP + self-reported port (+ LAN addr for same-network hairpin). |
-| **Match reports → XP** | `POST /v1/match-report`: server key + HMAC-SHA256(`ts.body`) + 10-min replay window. **Idempotent on matchId** (duplicate → `{duplicate:true}`, zero re-grant). Raw stats in → XP computed here under versioned rules (v1: completion 250 / elims 10 / objective 10 / builder 2 / win 100 / first-match-of-day 250; clamps). Append-only `xp_events` ledger; `app_profiles` is a rebuildable projection. Bots + accountless players recorded but never granted. |
-| **Progression** | Soft-exponential curve `600×1.06^L` (cap 50); `GET /v1/profile/me` returns level/progress/stats/unlocks. `POST /v1/identities/link` attaches an install GUID → retroactively claims pre-account match history. |
-| **Store** | `GET /v1/store` (showcase: unlock defs + pack SKUs + owned; checkout deep-links to the website — no card entry in-game). `POST /v1/promo/redeem` (single-use enforced atomically). `/v1/admin/promo` mints comp codes. All-Access pack = `all_access` entitlement; unlock criteria `{"type":"entitlement","id":"all_access"}` light up automatically. |
+| **Match reports → XP** | `POST /v1/match-report`: server key + HMAC-SHA256(`ts.body`) + 10-min replay window. The match root, roster, XP ledger, daily claim, and profile projection commit in one D1 batch. Duplicate/failed requests cannot re-grant or strand a partial match. |
+| **Progression** | Flat 250 XP per level through 15, then half the original soft-exponential curve (cap 50). `GET /v1/profile/me` returns level/progress/stats/unlocks. `POST /v1/identities/link` attaches an install GUID but refuses to reassign one owned by another account. |
+| **Store** | `GET /v1/store` safely skips malformed stored JSON. `POST /v1/promo/redeem` atomically records the user redemption, consumes one use, and grants the entitlement; same-user retries are idempotent. |
 
 ## Local dev
 
 ```bash
 npm install
 npm run schema:local        # applies sql/{schema,auth-schema,seed}.sql to local D1
-# .dev.vars (already present):
-#   BETTER_AUTH_SECRET=...  ADMIN_KEY=dev-admin-key  PUBLIC_BASE_URL=http://127.0.0.1:8787
+# create .dev.vars locally (never commit it):
+#   BETTER_AUTH_SECRET=<32+ random chars>  ADMIN_KEY=dev-admin-key-for-smoke-only-32chars
+#   PUBLIC_BASE_URL=http://127.0.0.1:8787
 npm run dev                 # http://127.0.0.1:8787
-node scripts/smoke.mjs      # full end-to-end suite (25 checks)
+node scripts/smoke.mjs      # full end-to-end suite
 ```
 
 ## Deploy runbook (Tom — one time)
@@ -34,8 +35,15 @@ npx wrangler login
 npx wrangler d1 create combatforge_api          # paste database_id into wrangler.toml
 npm run schema:remote
 npx wrangler secret put BETTER_AUTH_SECRET      # openssl rand -hex 32
-npx wrangler secret put ADMIN_KEY               # long random string
+npx wrangler secret put ADMIN_KEY               # 32+ random chars; e.g. openssl rand -hex 32
 npm run deploy                                  # binds api.playcombatforge.com (zone is on this account)
+```
+
+For the existing production database, apply the tracked D1 migration before deploying the
+hardening release. Wrangler records it and will not apply it twice:
+
+```bash
+npm run migrate:epic:remote
 ```
 
 Provision a fleet server key (shown ONCE — store it on the VPS):
@@ -58,7 +66,8 @@ curl -X POST https://api.playcombatforge.com/v1/admin/promo \
 
 - **Login**: `POST /api/auth/device/code` `{client_id:"combatforge-game"}` → show `user_code` +
   "visit playcombatforge.com/link" → poll `POST /api/auth/device/token` every `interval`s →
-  store `access_token` in `Saved/CombatForge/`, send as `Authorization: Bearer` on every /v1 call.
+  store `access_token` in the per-user CombatForge directory (DPAPI-protected on Windows), send it
+  as `Authorization: Bearer` on every /v1 call.
 - **Server browser**: `GET /v1/servers` (Bearer) → rows → `open addr:port`. Quick-play:
   `GET /v1/quickplay?netProtocol=<PFBuild::NetProtocol>`. Private: `GET /v1/join/CODE`.
 - **Identity link** (once after login): `POST /v1/identities/link` `{guidHash:<GetLocalPlayerGuidHash()>}`.
@@ -83,6 +92,5 @@ curl -X POST https://api.playcombatforge.com/v1/admin/promo \
 
 - Real payment checkout (merchant-of-record webhook → `entitlements` insert) — store scaffolding
   + comp codes are live; MoR choice (Lemon Squeezy / Paddle) is Tom's call.
-- Rename flow at `turns13On` (schema carries the date; endpoint is trivial when the site UI exists).
 - Discord OAuth for 13+ (Better Auth social provider, gated behind the age screen) — config stub only.
 - Durable Object directory migration (D1 is ample at ≤12 servers).

@@ -15,6 +15,16 @@ import { evaluateUnlocks } from "./reports";
 
 type Vars = { userId: string };
 
+const parseStoredJson = (raw: unknown): unknown | null => {
+  if (typeof raw !== "string") return null;
+  try {
+    const value = JSON.parse(raw);
+    return value !== null && typeof value === "object" ? value : null;
+  } catch {
+    return null;
+  }
+};
+
 export const profileRoutes = new Hono<{ Bindings: Env; Variables: Vars }>();
 
 profileRoutes.get("/profile/me", async (c) => {
@@ -42,6 +52,7 @@ profileRoutes.get("/profile/me", async (c) => {
       eliminations: (prof?.eliminations as number) ?? 0,
       timesEliminated: (prof?.times_eliminated as number) ?? 0,
       tags: (prof?.tags as number) ?? 0,
+      builder: (prof?.builder as number) ?? 0,
     },
     unlocks: (unlocks ?? []).map((r: any) => r.unlock_id),
     entitlements: (ents ?? []).map((r: any) => r.entitlement_id),
@@ -55,10 +66,20 @@ profileRoutes.post("/identities/link", async (c) => {
   const guidHash = body?.guidHash?.toLowerCase() ?? "";
   if (!/^[0-9a-f]{40}$/.test(guidHash)) return c.json({ error: "bad guidHash" }, 400);
   const now = nowSec();
-  await c.env.DB.prepare(
+  const claimed = await c.env.DB.prepare(
     `INSERT INTO identities (guid_hash, user_id, linked_at, last_seen_at) VALUES (?, ?, ?, ?)
-     ON CONFLICT(guid_hash) DO UPDATE SET user_id = excluded.user_id, last_seen_at = excluded.last_seen_at`)
+     ON CONFLICT(guid_hash) DO NOTHING`)
     .bind(guidHash, userId, now, now).run();
+  if ((claimed.meta?.changes ?? 0) === 0) {
+    const existing = await c.env.DB.prepare(
+      `SELECT user_id FROM identities WHERE guid_hash = ?`).bind(guidHash).first();
+    if (existing?.user_id !== userId) {
+      return c.json({ error: "identity already linked to another account" }, 409);
+    }
+    await c.env.DB.prepare(
+      `UPDATE identities SET last_seen_at = ? WHERE guid_hash = ? AND user_id = ?`)
+      .bind(now, guidHash, userId).run();
+  }
   // Retro-attach any recorded matches from before the account existed.
   await c.env.DB.prepare(
     "UPDATE match_players SET user_id = ? WHERE guid_hash = ? AND user_id IS NULL")
@@ -78,6 +99,18 @@ storeRoutes.get("/store", async (c) => {
     c.env.DB.prepare("SELECT entitlement_id FROM entitlements WHERE user_id = ?").bind(userId).all(),
   ]);
   const ownedSet = new Set((owned ?? []).map((r: any) => r.unlock_id));
+  const unlocks = (defs ?? []).flatMap((d: any) => {
+    const criteria = parseStoredJson(d.criteria);
+    const payload = parseStoredJson(d.payload);
+    if (!criteria || !payload) return [];
+    return [{
+      id: d.unlock_id,
+      kind: d.kind,
+      criteria,
+      payload,
+      owned: ownedSet.has(d.unlock_id),
+    }];
+  });
   return c.json({
     packs: [
       {
@@ -89,13 +122,7 @@ storeRoutes.get("/store", async (c) => {
         checkoutUrl: "https://playcombatforge.com/store/all-access",
       },
     ],
-    unlocks: (defs ?? []).map((d: any) => ({
-      id: d.unlock_id,
-      kind: d.kind,
-      criteria: JSON.parse(d.criteria),
-      payload: JSON.parse(d.payload),
-      owned: ownedSet.has(d.unlock_id),
-    })),
+    unlocks,
   });
 });
 
@@ -109,20 +136,75 @@ storeRoutes.post("/promo/redeem", async (c) => {
     "SELECT entitlement_id, max_uses, uses, expires_at FROM promo_codes WHERE code = ?")
     .bind(code).first();
   if (!promo) return c.json({ error: "unknown code" }, 404);
-  if (promo.expires_at && (promo.expires_at as number) < nowSec()) {
+  const now = nowSec();
+  if (promo.expires_at && (promo.expires_at as number) < now) {
     return c.json({ error: "code expired" }, 410);
   }
-  // Atomic use-count claim: the WHERE clause makes double-spends impossible.
-  const claim = await c.env.DB.prepare(
-    "UPDATE promo_codes SET uses = uses + 1 WHERE code = ? AND uses < max_uses")
-    .bind(code).run();
-  if ((claim.meta?.changes ?? 0) === 0) return c.json({ error: "code fully used" }, 410);
-  await c.env.DB.prepare(
-    `INSERT INTO entitlements (user_id, entitlement_id, granted_at, source)
-     VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING`)
-    .bind(userId, promo.entitlement_id as string, nowSec(), `promo:${code}`).run();
+  const entitlementId = promo.entitlement_id as string;
+  // Preserve the endpoint's idempotent retry contract: a user retrying this exact code should be
+  // distinguishable from a user who already owns the entitlement through a purchase/admin grant.
+  // The equivalent check after the batch is still required to arbitrate concurrent first retries.
+  const priorRedemption = await c.env.DB.prepare(
+    `SELECT entitlement_id FROM promo_redemptions WHERE code = ? AND user_id = ?`)
+    .bind(code, userId).first();
+  if (priorRedemption) {
+    return c.json({
+      ok: true,
+      entitlement: priorRedemption.entitlement_id,
+      alreadyRedeemed: true,
+      unlocksGranted: 0,
+    });
+  }
+  const owned = await c.env.DB.prepare(
+    `SELECT 1 FROM entitlements WHERE user_id = ? AND entitlement_id = ?`)
+    .bind(userId, entitlementId).first();
+  if (owned) {
+    return c.json({ ok: true, entitlement: entitlementId, alreadyOwned: true, unlocksGranted: 0 });
+  }
+
+  // One transactional batch owns the redemption, consumes one use, and grants the entitlement.
+  // claim_token makes the latter statements no-ops when this user retries a code they already used.
+  const claimToken = crypto.randomUUID();
+  const results = await c.env.DB.batch([
+    c.env.DB.prepare(
+      `INSERT INTO promo_redemptions
+         (code, user_id, entitlement_id, redeemed_at, claim_token)
+       SELECT code, ?, entitlement_id, ?, ? FROM promo_codes
+       WHERE code = ? AND uses < max_uses AND (expires_at IS NULL OR expires_at >= ?)
+         AND NOT EXISTS (
+           SELECT 1 FROM entitlements WHERE user_id = ? AND entitlement_id = promo_codes.entitlement_id)
+       ON CONFLICT(code, user_id) DO NOTHING`)
+      .bind(userId, now, claimToken, code, now, userId),
+    c.env.DB.prepare(
+      `UPDATE promo_codes SET uses = uses + 1
+       WHERE code = ? AND EXISTS (
+         SELECT 1 FROM promo_redemptions WHERE code = ? AND user_id = ? AND claim_token = ?)`)
+      .bind(code, code, userId, claimToken),
+    c.env.DB.prepare(
+      `INSERT INTO entitlements (user_id, entitlement_id, granted_at, source)
+       SELECT user_id, entitlement_id, redeemed_at, 'promo:' || code
+       FROM promo_redemptions WHERE code = ? AND user_id = ? AND claim_token = ?
+       ON CONFLICT(user_id, entitlement_id) DO NOTHING`)
+      .bind(code, userId, claimToken),
+  ]);
+
+  if ((results[0]?.meta?.changes ?? 0) === 0) {
+    const prior = await c.env.DB.prepare(
+      `SELECT entitlement_id FROM promo_redemptions WHERE code = ? AND user_id = ?`)
+      .bind(code, userId).first();
+    if (prior) {
+      return c.json({ ok: true, entitlement: prior.entitlement_id, alreadyRedeemed: true, unlocksGranted: 0 });
+    }
+    const nowOwned = await c.env.DB.prepare(
+      `SELECT 1 FROM entitlements WHERE user_id = ? AND entitlement_id = ?`)
+      .bind(userId, entitlementId).first();
+    if (nowOwned) {
+      return c.json({ ok: true, entitlement: entitlementId, alreadyOwned: true, unlocksGranted: 0 });
+    }
+    return c.json({ error: "code fully used" }, 410);
+  }
   const granted = await evaluateUnlocks(c.env, userId);
-  return c.json({ ok: true, entitlement: promo.entitlement_id, unlocksGranted: granted });
+  return c.json({ ok: true, entitlement: entitlementId, unlocksGranted: granted });
 });
 
 // ---- admin provisioning (ADMIN_KEY bearer): server keys + promo codes ----------------------
@@ -131,7 +213,7 @@ export const adminRoutes = new Hono<{ Bindings: Env }>();
 
 adminRoutes.use("*", async (c, next) => {
   const authz = c.req.header("Authorization") ?? "";
-  if (!c.env.ADMIN_KEY || authz !== `Bearer ${c.env.ADMIN_KEY}`) {
+  if (!c.env.ADMIN_KEY || c.env.ADMIN_KEY.length < 32 || authz !== `Bearer ${c.env.ADMIN_KEY}`) {
     return c.json({ error: "admin key required" }, 403);
   }
   await next();
@@ -140,14 +222,17 @@ adminRoutes.use("*", async (c, next) => {
 /** Provision a fleet instance: returns the ONE-TIME plaintext key (only the hash is stored). */
 adminRoutes.post("/servers", async (c) => {
   const body = await c.req.json<{ name: string; region?: string }>().catch(() => null);
-  if (!body?.name) return c.json({ error: "name required" }, 400);
+  const name = body?.name?.trim() ?? "";
+  const region = body?.region?.trim() || "us-east";
+  if (!name || name.length > 80) return c.json({ error: "name must be 1-80 characters" }, 400);
+  if (!/^[a-z0-9-]{2,32}$/i.test(region)) return c.json({ error: "bad region" }, 400);
   const serverId = crypto.randomUUID();
   const keyBytes = crypto.getRandomValues(new Uint8Array(32));
   const key = [...keyBytes].map((b) => b.toString(16).padStart(2, "0")).join("");
   const { sha256Hex } = await import("./hmac");
   await c.env.DB.prepare(
     "INSERT INTO game_servers (server_id, name, key_hash, region, active, created_at) VALUES (?, ?, ?, ?, 1, ?)")
-    .bind(serverId, body.name, await sha256Hex(key), body.region ?? "us-east", nowSec()).run();
+    .bind(serverId, name, await sha256Hex(key), region, nowSec()).run();
   return c.json({ serverId, key, note: "Store this key on the fleet box — it is shown exactly once." });
 });
 
@@ -155,15 +240,32 @@ adminRoutes.post("/promo", async (c) => {
   const body = await c.req.json<{
     code?: string; entitlementId: string; maxUses?: number; expiresAt?: number; note?: string;
   }>().catch(() => null);
-  if (!body?.entitlementId) return c.json({ error: "entitlementId required" }, 400);
-  let code = body.code?.toUpperCase();
+  const entitlementId = body?.entitlementId?.trim() ?? "";
+  const maxUses = body?.maxUses ?? 1;
+  const expiresAt = body?.expiresAt ?? null;
+  const note = body?.note?.trim() || null;
+  if (!/^[a-z0-9][a-z0-9_:-]{0,63}$/i.test(entitlementId)) {
+    return c.json({ error: "bad entitlementId" }, 400);
+  }
+  if (!Number.isInteger(maxUses) || maxUses < 1 || maxUses > 100_000) {
+    return c.json({ error: "maxUses must be an integer from 1 to 100000" }, 400);
+  }
+  if (expiresAt !== null && (!Number.isInteger(expiresAt) || expiresAt <= nowSec())) {
+    return c.json({ error: "expiresAt must be a future unix timestamp" }, 400);
+  }
+  if (note && note.length > 500) return c.json({ error: "note too long" }, 400);
+  let code = body?.code?.toUpperCase().trim();
   if (!code) {
     const alphabet = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
     const bytes = crypto.getRandomValues(new Uint8Array(8));
     code = [...bytes].map((b) => alphabet[b % alphabet.length]).join("");
   }
-  await c.env.DB.prepare(
-    "INSERT INTO promo_codes (code, entitlement_id, max_uses, uses, expires_at, created_at, note) VALUES (?, ?, ?, 0, ?, ?, ?)")
-    .bind(code, body.entitlementId, body.maxUses ?? 1, body.expiresAt ?? null, nowSec(), body.note ?? null).run();
+  if (!/^[A-Z2-9-]{4,24}$/.test(code)) return c.json({ error: "bad code" }, 400);
+  const inserted = await c.env.DB.prepare(
+    `INSERT INTO promo_codes
+       (code, entitlement_id, max_uses, uses, expires_at, created_at, note)
+     VALUES (?, ?, ?, 0, ?, ?, ?) ON CONFLICT(code) DO NOTHING`)
+    .bind(code, entitlementId, maxUses, expiresAt, nowSec(), note).run();
+  if ((inserted.meta?.changes ?? 0) === 0) return c.json({ error: "code already exists" }, 409);
   return c.json({ ok: true, code });
 });
