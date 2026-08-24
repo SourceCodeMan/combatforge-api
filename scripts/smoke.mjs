@@ -8,7 +8,7 @@
 import { createHmac } from "node:crypto";
 
 const BASE = process.env.SMOKE_BASE ?? "http://127.0.0.1:8787";
-const ADMIN_KEY = process.env.SMOKE_ADMIN_KEY ?? "dev-admin-key";
+const ADMIN_KEY = process.env.SMOKE_ADMIN_KEY ?? "dev-admin-key-for-smoke-only-32chars";
 
 let failures = 0;
 const check = (name, cond, detail = "") => {

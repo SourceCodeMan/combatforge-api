@@ -48,7 +48,11 @@ app.use("*", secureHeaders({
   },
 }));
 
-app.get("/healthz", (c) => c.json({ ok: true, service: "combatforge-api", base: c.env.PUBLIC_BASE_URL }));
+app.get("/healthz", (c) => {
+  const configured = !!(c.env.DB && c.env.BETTER_AUTH_SECRET?.length >= 32 &&
+    c.env.ADMIN_KEY?.length >= 32 && c.env.GAME_CLIENT_ID && c.env.PUBLIC_BASE_URL);
+  return c.json({ ok: configured, service: "combatforge-api" }, configured ? 200 : 503);
+});
 
 // Better Auth handles everything under /api/auth/* (device flow endpoints included).
 app.on(["GET", "POST"], "/api/auth/*", async (c) => {

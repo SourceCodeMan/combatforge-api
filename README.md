@@ -22,7 +22,8 @@ same stack as `combatforge-bugs`. Design docs live in the game repo:
 npm install
 npm run schema:local        # applies sql/{schema,auth-schema,seed}.sql to local D1
 # create .dev.vars locally (never commit it):
-#   BETTER_AUTH_SECRET=...  ADMIN_KEY=dev-admin-key  PUBLIC_BASE_URL=http://127.0.0.1:8787
+#   BETTER_AUTH_SECRET=<32+ random chars>  ADMIN_KEY=dev-admin-key-for-smoke-only-32chars
+#   PUBLIC_BASE_URL=http://127.0.0.1:8787
 npm run dev                 # http://127.0.0.1:8787
 node scripts/smoke.mjs      # full end-to-end suite
 ```
@@ -34,7 +35,7 @@ npx wrangler login
 npx wrangler d1 create combatforge_api          # paste database_id into wrangler.toml
 npm run schema:remote
 npx wrangler secret put BETTER_AUTH_SECRET      # openssl rand -hex 32
-npx wrangler secret put ADMIN_KEY               # long random string
+npx wrangler secret put ADMIN_KEY               # 32+ random chars; e.g. openssl rand -hex 32
 npm run deploy                                  # binds api.playcombatforge.com (zone is on this account)
 ```
 

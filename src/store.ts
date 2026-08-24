@@ -199,7 +199,7 @@ export const adminRoutes = new Hono<{ Bindings: Env }>();
 
 adminRoutes.use("*", async (c, next) => {
   const authz = c.req.header("Authorization") ?? "";
-  if (!c.env.ADMIN_KEY || authz !== `Bearer ${c.env.ADMIN_KEY}`) {
+  if (!c.env.ADMIN_KEY || c.env.ADMIN_KEY.length < 32 || authz !== `Bearer ${c.env.ADMIN_KEY}`) {
     return c.json({ error: "admin key required" }, 403);
   }
   await next();
