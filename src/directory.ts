@@ -17,6 +17,20 @@ export const STALE_AFTER_SEC = 30;
 
 type Vars = { userId: string };
 
+const validPort = (value: unknown): value is number =>
+  typeof value === "number" && Number.isInteger(value) && value >= 1024 && value <= 65535;
+
+const validInt = (value: unknown, min: number, max: number): value is number =>
+  typeof value === "number" && Number.isSafeInteger(value) && value >= min && value <= max;
+
+const cleanText = (value: unknown, maxLength = 64): string | null => {
+  if (value === undefined || value === null) return "";
+  if (typeof value !== "string" || value.length > maxLength || /[\u0000-\u001f\u007f]/.test(value)) {
+    return null;
+  }
+  return value.trim();
+};
+
 // ---- fleet-side (server-key auth) ----------------------------------------------------------
 
 export const serverRoutes = new Hono<{ Bindings: Env }>();
@@ -46,9 +60,18 @@ serverRoutes.post("/register", async (c) => {
   const body = await c.req.json<{
     port: number; lanAddr?: string; map?: string; mode?: string; format?: string;
     maxPlayers?: number; netProtocol: number; private?: boolean;
-  }>();
-  if (!body?.port || typeof body.netProtocol !== "number") {
-    return c.json({ error: "port + netProtocol required" }, 400);
+  }>().catch(() => null);
+  if (!body || !validPort(body.port) || !validInt(body.netProtocol, 1, 1_000_000)) {
+    return c.json({ error: "valid port + netProtocol required" }, 400);
+  }
+  const maxPlayers = body.maxPlayers ?? 12;
+  const map = cleanText(body.map);
+  const mode = cleanText(body.mode);
+  const format = cleanText(body.format);
+  const lanAddr = cleanText(body.lanAddr, 64);
+  if (!validInt(maxPlayers, 1, 64) || map === null || mode === null || format === null ||
+      lanAddr === null || (body.private !== undefined && typeof body.private !== "boolean")) {
+    return c.json({ error: "bad server metadata" }, 400);
   }
   // Join address = the IP the Worker OBSERVED (spoof-proof); port is self-reported.
   const observedIp = c.req.header("CF-Connecting-IP") ?? "0.0.0.0";
@@ -69,8 +92,8 @@ serverRoutes.post("/register", async (c) => {
        port=excluded.port, map=excluded.map, mode=excluded.mode, format=excluded.format,
        max_players=excluded.max_players, net_protocol=excluded.net_protocol,
        private=excluded.private, join_code=excluded.join_code, last_seen_at=excluded.last_seen_at`)
-    .bind(sid, observedIp, body.lanAddr ?? null, body.port, body.map ?? "", body.mode ?? "",
-      body.format ?? "", body.maxPlayers ?? 12, body.netProtocol, isPrivate ? 1 : 0, joinCode, nowSec())
+    .bind(sid, observedIp, lanAddr || null, body.port, map, mode,
+      format, maxPlayers, body.netProtocol, isPrivate ? 1 : 0, joinCode, nowSec())
     .run();
   // A re-register on a new build sweeps any legacy bare-id row this key left behind.
   await c.env.DB.prepare("DELETE FROM server_status WHERE server_id = ?").bind(auth.serverId).run();
@@ -82,7 +105,18 @@ serverRoutes.post("/heartbeat", async (c) => {
   if (auth instanceof Response) return auth;
   const body = await c.req.json<{
     players: number; phase?: string; map?: string; mode?: string; format?: string; port?: number;
-  }>();
+  }>().catch(() => null);
+  if (!body || !validInt(body.players, 0, 64) ||
+      (body.port !== undefined && !validPort(body.port))) {
+    return c.json({ error: "bad heartbeat" }, 400);
+  }
+  const phase = cleanText(body.phase, 32);
+  const map = cleanText(body.map);
+  const mode = cleanText(body.mode);
+  const format = cleanText(body.format);
+  if (phase === null || map === null || mode === null || format === null) {
+    return c.json({ error: "bad heartbeat metadata" }, 400);
+  }
   // Port present (fleet-aware build) → exact instance row. Absent (pre-fleet build, exactly one
   // instance per key) → match any row this key owns, bare or suffixed.
   const where = typeof body.port === "number"
@@ -92,8 +126,8 @@ serverRoutes.post("/heartbeat", async (c) => {
     `UPDATE server_status SET players = ?, phase = COALESCE(?, phase), map = COALESCE(?, map),
        mode = COALESCE(?, mode), format = COALESCE(?, format), last_seen_at = ?
      ${where.sql}`)
-    .bind(body.players ?? 0, body.phase ?? null, body.map ?? null, body.mode ?? null,
-      body.format ?? null, nowSec(), ...where.bind)
+    .bind(body.players, phase || null, map || null, mode || null,
+      format || null, nowSec(), ...where.bind)
     .run();
   if ((res.meta?.changes ?? 0) === 0) {
     return c.json({ error: "not registered — call /register first" }, 409);
@@ -107,7 +141,10 @@ serverRoutes.post("/unregister", async (c) => {
   let port: number | undefined;
   try {
     const body = await c.req.json<{ port?: number }>();
-    port = typeof body?.port === "number" ? body.port : undefined;
+    if (body?.port !== undefined && !validPort(body.port)) {
+      return c.json({ error: "bad port" }, 400);
+    }
+    port = validPort(body?.port) ? body.port : undefined;
   } catch { /* legacy builds send "{}" or nothing */ }
   if (typeof port === "number") {
     await c.env.DB.prepare("DELETE FROM server_status WHERE server_id = ?")
@@ -147,6 +184,7 @@ browseRoutes.get("/servers", async (c) => {
 // Quick-play: fullest non-full compatible server — concentrates a small population.
 browseRoutes.get("/quickplay", async (c) => {
   const netProtocol = Number(c.req.query("netProtocol") ?? "0");
+  if (!validInt(netProtocol, 1, 1_000_000)) return c.json({ error: "bad netProtocol" }, 400);
   const cutoff = nowSec() - STALE_AFTER_SEC;
   const row = await c.env.DB.prepare(
     PUBLIC_LIST_SQL + ` AND s.net_protocol = ? AND s.players < s.max_players

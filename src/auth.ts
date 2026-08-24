@@ -7,12 +7,11 @@ import type { Env } from "./env";
  * Better Auth instance, built per-request (Workers only expose env per-request).
  * Pinned better-auth >= 1.6.11 (device-flow hijack GHSA-cq3f-vc6p-68fh fixed in 1.6.11).
  *
- * Identity model (docs/multiplayer-plan.md §5, COPPA posture):
- *  - 13+  : username + password (email optional — we synthesize a placeholder when absent so the
- *           core schema is satisfied while collecting zero contact info).
- *  - <13  : generated display name (adjective+animal), NO email, NO real name, no DOB stored —
- *           only isChild + turns13On (the derived date the rename option auto-unlocks;
- *           FTC permits collecting age info solely for verification).
+ * Identity model (release posture):
+ *  - Accounts are 13+ only. /signup performs the age check before invoking Better Auth and never
+ *    stores the submitted birth date.
+ *  - Username + password; a non-routable placeholder email satisfies the core schema without
+ *    collecting contact information.
  *  - The GAME never sees a password: it logs in via the RFC 8628 device flow
  *    (shows a 6-char code -> player approves at /link in a browser) and stores the
  *    resulting session token, sent as Authorization: Bearer (bearer plugin).
@@ -49,7 +48,7 @@ export function buildAuth(env: Env) {
       },
     },
     session: {
-      expiresIn: 60 * 60 * 24 * 90, // 90 days — the game's stored token should survive between sessions
+      expiresIn: 60 * 60 * 24 * 30,
       updateAge: 60 * 60 * 24,
     },
     advanced: {

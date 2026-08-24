@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import { secureHeaders } from "hono/secure-headers";
 import type { Env } from "./env";
 import { buildAuth } from "./auth";
 import { buildPages } from "./pages";
@@ -24,10 +25,52 @@ import { profileRoutes, storeRoutes, adminRoutes } from "./store";
 
 const app = new Hono<{ Bindings: Env; Variables: { userId: string } }>();
 
+app.use("*", secureHeaders({
+  contentSecurityPolicy: {
+    defaultSrc: ["'self'"],
+    baseUri: ["'none'"],
+    connectSrc: ["'self'"],
+    formAction: ["'self'"],
+    frameAncestors: ["'none'"],
+    frameSrc: ["'none'"],
+    imgSrc: ["'self'", "data:"],
+    objectSrc: ["'none'"],
+    scriptSrc: ["'self'"],
+    styleSrc: ["'self'", "'unsafe-inline'"],
+  },
+  referrerPolicy: "no-referrer",
+  strictTransportSecurity: "max-age=31536000; includeSubDomains",
+  xFrameOptions: "DENY",
+  permissionsPolicy: {
+    camera: false,
+    geolocation: false,
+    microphone: false,
+  },
+}));
+
 app.get("/healthz", (c) => c.json({ ok: true, service: "combatforge-api", base: c.env.PUBLIC_BASE_URL }));
 
 // Better Auth handles everything under /api/auth/* (device flow endpoints included).
-app.on(["GET", "POST"], "/api/auth/*", (c) => buildAuth(c.env).handler(c.req.raw));
+app.on(["GET", "POST"], "/api/auth/*", async (c) => {
+  const path = new URL(c.req.url).pathname;
+  // Account creation must pass through /signup so the 13+ gate cannot be bypassed by calling the
+  // underlying Better Auth endpoint directly.
+  if (c.req.method === "POST" && path.includes("/sign-up/")) {
+    return c.json({ error: "use /signup to create an account" }, 403);
+  }
+  // Legacy under-13 accounts are disabled for release. Keep the response generic and do not mint
+  // a new session even if a client calls Better Auth directly instead of using the login page.
+  if (c.req.method === "POST" && path.endsWith("/sign-in/username")) {
+    const body = await c.req.raw.clone().json().catch(() => null) as { username?: string } | null;
+    const username = body?.username?.trim() ?? "";
+    if (username) {
+      const restricted = await c.env.DB.prepare(
+        `SELECT isChild FROM user WHERE username = ? COLLATE NOCASE`).bind(username).first();
+      if (restricted?.isChild) return c.json({ error: "account unavailable" }, 403);
+    }
+  }
+  return buildAuth(c.env).handler(c.req.raw);
+});
 
 // Human-facing pages (age-gated signup, login, device-link approval).
 app.route("/", buildPages(buildAuth));
@@ -48,6 +91,9 @@ const requireSession = async (c: any, next: () => Promise<void>) => {
   const auth = buildAuth(c.env);
   const session = await auth.api.getSession({ headers: c.req.raw.headers });
   if (!session) return c.json({ error: "sign in required" }, 401);
+  const user = await c.env.DB.prepare(`SELECT isChild FROM user WHERE id = ?`)
+    .bind(session.user.id).first();
+  if (user?.isChild) return c.json({ error: "account unavailable", code: "AGE_RESTRICTED" }, 403);
   c.set("userId", session.user.id);
   await next();
 };

@@ -52,6 +52,9 @@ reportRoutes.post("/match-report", async (c) => {
 
   // -- verify HMAC + timestamp (replay window) --
   const rawBody = await c.req.text();
+  if (new TextEncoder().encode(rawBody).byteLength > 256 * 1024) {
+    return c.json({ error: "report too large" }, 413);
+  }
   const ts = Number(c.req.header("X-Timestamp") ?? "0");
   const sig = c.req.header("X-Signature") ?? "";
   if (!ts || Math.abs(nowSec() - ts) > MAX_TIMESTAMP_SKEW_SEC) {
@@ -68,82 +71,157 @@ reportRoutes.post("/match-report", async (c) => {
   }
 
   // -- plausibility clamps (defense-in-depth even with a valid key) --
-  if (!report.matchId || typeof report.matchId !== "string" || report.matchId.length > 64) {
+  const hasControls = (value: string): boolean => /[\u0000-\u001f\u007f]/.test(value);
+  if (!report || typeof report !== "object" || !report.matchId ||
+      typeof report.matchId !== "string" || report.matchId.length > 64 ||
+      hasControls(report.matchId)) {
     return c.json({ error: "bad matchId" }, 400);
   }
   if (!Array.isArray(report.players) || report.players.length === 0 || report.players.length > 12) {
     return c.json({ error: "bad roster" }, 400);
   }
-  if (report.durationSec < 30 || report.durationSec > 3 * 60 * 60) {
+  if (!Number.isInteger(report.durationSec) || report.durationSec < 30 ||
+      report.durationSec > 3 * 60 * 60) {
     return c.json({ error: "implausible duration" }, 400);
   }
+  if (typeof report.mode !== "string" || !report.mode || report.mode.length > 64 || hasControls(report.mode) ||
+      typeof report.map !== "string" || !report.map || report.map.length > 64 || hasControls(report.map) ||
+      (report.arenaId !== undefined && (typeof report.arenaId !== "string" ||
+        report.arenaId.length > 128 || hasControls(report.arenaId)))) {
+    return c.json({ error: "bad match metadata" }, 400);
+  }
+  if (!Number.isInteger(report.endedAt) || report.endedAt <= 0 ||
+      (report.startedAt !== undefined && (!Number.isInteger(report.startedAt) ||
+        report.startedAt <= 0 || report.startedAt > report.endedAt)) ||
+      !Number.isInteger(report.netProtocol) || report.netProtocol < 1 || report.netProtocol > 1_000_000 ||
+      ![0, 1, 255].includes(report.winnerTeam)) {
+    return c.json({ error: "bad match metadata" }, 400);
+  }
 
-  // -- idempotency root: INSERT the match; conflict = already processed --
-  const inserted = await c.env.DB.prepare(
-    `INSERT INTO matches (match_id, server_id, mode, map, arena_id, started_at, ended_at,
-       duration_sec, winner_team, net_protocol, raw)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-     ON CONFLICT(match_id) DO NOTHING`)
-    .bind(report.matchId, server.server_id as string, report.mode ?? "", report.map ?? "",
-      report.arenaId ?? null, report.startedAt ?? null, report.endedAt ?? nowSec(),
-      report.durationSec, report.winnerTeam ?? 255, report.netProtocol ?? 0, rawBody)
-    .run();
-  if ((inserted.meta?.changes ?? 0) === 0) {
-    return c.json({ ok: true, duplicate: true });
+  const validStat = (value: unknown, max = 1_000_000): value is number =>
+    typeof value === "number" && Number.isSafeInteger(value) && value >= 0 && value <= max;
+  const seenGuids = new Set<string>();
+  const seenExplicitUsers = new Set<string>();
+  for (const p of report.players) {
+    if (!p || typeof p !== "object" || typeof p.guidHash !== "string" ||
+        !/^[0-9a-f]{40}$/.test(p.guidHash) || seenGuids.has(p.guidHash)) {
+      return c.json({ error: "bad or duplicate player identity" }, 400);
+    }
+    seenGuids.add(p.guidHash);
+    if (p.userId !== undefined && (typeof p.userId !== "string" || !p.userId || p.userId.length > 128)) {
+      return c.json({ error: "bad player account" }, 400);
+    }
+    if (p.userId && !p.isBot) {
+      if (seenExplicitUsers.has(p.userId)) return c.json({ error: "duplicate player account" }, 400);
+      seenExplicitUsers.add(p.userId);
+    }
+    if (![0, 1, 255].includes(p.team) || !validStat(p.elims, 10_000) ||
+        !validStat(p.timesElim, 10_000) || !validStat(p.score) || !validStat(p.tags, 10_000) ||
+        !validStat(p.objective, 10_000) || !validStat(p.builder, 100_000) ||
+        typeof p.completed !== "boolean" || (p.isBot !== undefined && typeof p.isBot !== "boolean")) {
+      return c.json({ error: "bad player stats" }, 400);
+    }
+  }
+
+  type Resolved = { player: MatchReport["players"][number]; userId: string | null };
+  const resolved: Resolved[] = [];
+  const resolvedUsers = new Set<string>();
+  for (const player of report.players) {
+    const link = await c.env.DB.prepare(
+      `SELECT user_id FROM identities WHERE guid_hash = ?`).bind(player.guidHash).first();
+    if (player.userId && link?.user_id && link.user_id !== player.userId) {
+      return c.json({ error: "player identity/account mismatch" }, 409);
+    }
+    let userId = player.isBot ? null : (player.userId ?? (link?.user_id as string | undefined) ?? null);
+    if (userId) {
+      const account = await c.env.DB.prepare(`SELECT id, isChild FROM user WHERE id = ?`).bind(userId).first();
+      if (!account || account.isChild) userId = null;
+    }
+    if (userId && resolvedUsers.has(userId)) {
+      return c.json({ error: "multiple roster entries resolve to one account" }, 400);
+    }
+    if (userId) resolvedUsers.add(userId);
+    resolved.push({ player, userId });
   }
 
   const now = nowSec();
-  const stmts: D1PreparedStatement[] = [];
+  const dayStart = Math.floor(now / 86400) * 86400;
+  const processingToken = crypto.randomUUID();
+  const ownsMatch = `EXISTS (
+    SELECT 1 FROM matches
+    WHERE match_id = ? AND processing_token = ? AND processed_at IS NULL)`;
+  const stmts: D1PreparedStatement[] = [
+    c.env.DB.prepare(
+      `INSERT INTO matches (match_id, server_id, mode, map, arena_id, started_at, ended_at,
+         duration_sec, winner_team, net_protocol, raw, processing_token, processed_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+       ON CONFLICT(match_id) DO NOTHING`)
+      .bind(report.matchId, server.server_id as string, report.mode, report.map,
+        report.arenaId ?? null, report.startedAt ?? null, report.endedAt,
+        report.durationSec, report.winnerTeam, report.netProtocol, rawBody, processingToken),
+    c.env.DB.prepare(
+      `UPDATE matches SET processing_token = ?
+       WHERE match_id = ? AND processed_at IS NULL AND processing_token IS NULL`)
+      .bind(processingToken, report.matchId),
+  ];
+
   const grantedUsers: string[] = [];
-
-  for (const p of report.players) {
-    if (!p?.guidHash || !/^[0-9a-f]{40}$/.test(p.guidHash)) continue;
-
-    // Resolve the account: explicit userId (token join) or the identities bridge.
-    let userId = p.userId ?? null;
-    if (!userId) {
-      const link = await c.env.DB.prepare(
-        "SELECT user_id FROM identities WHERE guid_hash = ?").bind(p.guidHash).first();
-      userId = (link?.user_id as string) ?? null;
-    }
-
+  for (const { player: p, userId } of resolved) {
     stmts.push(c.env.DB.prepare(
       `INSERT INTO match_players (match_id, user_id, guid_hash, team, elims, times_elim, score,
          tags, objective, builder, completed, is_bot)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${ownsMatch}
        ON CONFLICT(match_id, guid_hash) DO NOTHING`)
-      .bind(report.matchId, userId, p.guidHash, p.team ?? 255,
-        p.elims | 0, p.timesElim | 0, p.score | 0, p.tags | 0,
-        p.objective | 0, p.builder | 0, p.completed ? 1 : 0, p.isBot ? 1 : 0));
+      .bind(report.matchId, userId, p.guidHash, p.team, p.elims, p.timesElim, p.score,
+        p.tags, p.objective, p.builder, p.completed ? 1 : 0, p.isBot ? 1 : 0,
+        report.matchId, processingToken));
 
-    if (!userId || p.isBot) continue; // no account (yet) or bot: history recorded, no XP
-
-    // First MATCH of the day (participation-gated, UTC day).
-    const dayStart = Math.floor(now / 86400) * 86400;
-    const daily = await c.env.DB.prepare(
-      "SELECT 1 FROM xp_events WHERE user_id = ? AND source = 'daily' AND created_at >= ? LIMIT 1")
-      .bind(userId, dayStart).first();
-
+    if (!userId || p.isBot) continue;
     const stats: PlayerStats = {
-      elims: p.elims | 0, tags: p.tags | 0, objective: p.objective | 0, builder: p.builder | 0,
-      completed: !!p.completed,
+      elims: p.elims,
+      tags: p.tags,
+      objective: p.objective,
+      builder: p.builder,
+      completed: p.completed,
       won: report.winnerTeam !== 255 && p.team === report.winnerTeam,
     };
-    const events = computeXpEvents(stats, !daily);
-    for (const e of events) {
+
+    if (stats.completed) {
       stmts.push(c.env.DB.prepare(
-        `INSERT INTO xp_events (user_id, match_id, source, amount, rule_version, meta, created_at)
-         VALUES (?, ?, ?, ?, ?, '{}', ?)
-         ON CONFLICT(match_id, user_id, source) DO NOTHING`)
-        .bind(userId, report.matchId, e.source, e.amount, RULE_VERSION, now));
+        `INSERT INTO daily_bonus_claims (user_id, day_start, match_id, created_at)
+         SELECT ?, ?, ?, ? WHERE ${ownsMatch}
+         ON CONFLICT(user_id, day_start) DO NOTHING`)
+        .bind(userId, dayStart, report.matchId, now, report.matchId, processingToken));
     }
 
-    // Projection update (rebuildable from the ledger at any time).
-    const xpGain = events.reduce((a, e) => a + e.amount, 0);
+    for (const event of computeXpEvents(stats, false)) {
+      stmts.push(c.env.DB.prepare(
+        `INSERT INTO xp_events (user_id, match_id, source, amount, rule_version, meta, created_at)
+         SELECT ?, ?, ?, ?, ?, '{}', ? WHERE ${ownsMatch}
+         ON CONFLICT(match_id, user_id, source) DO NOTHING`)
+        .bind(userId, report.matchId, event.source, event.amount, RULE_VERSION, now,
+          report.matchId, processingToken));
+    }
+    if (stats.completed) {
+      stmts.push(c.env.DB.prepare(
+        `INSERT INTO xp_events (user_id, match_id, source, amount, rule_version, meta, created_at)
+         SELECT ?, ?, 'daily', 250, ?, '{}', ?
+         WHERE ${ownsMatch} AND EXISTS (
+           SELECT 1 FROM daily_bonus_claims WHERE user_id = ? AND day_start = ? AND match_id = ?)
+         ON CONFLICT(match_id, user_id, source) DO NOTHING`)
+        .bind(userId, report.matchId, RULE_VERSION, now, report.matchId, processingToken,
+          userId, dayStart, report.matchId));
+    }
+
+    // Derive the projection delta from the ledger rows that this same transaction inserted. This
+    // prevents the projection from diverging when a ledger write is deduplicated.
     stmts.push(c.env.DB.prepare(
       `INSERT INTO app_profiles (user_id, xp_total, playtime_sec, matches_played, wins,
-         eliminations, times_eliminated, tags, updated_at)
-       VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?)
+         eliminations, times_eliminated, tags, builder, updated_at)
+       SELECT ?, COALESCE((
+         SELECT SUM(amount) FROM xp_events WHERE user_id = ? AND match_id = ?), 0),
+         ?, 1, ?, ?, ?, ?, ?, ?
+       WHERE ${ownsMatch}
        ON CONFLICT(user_id) DO UPDATE SET
          xp_total = xp_total + excluded.xp_total,
          playtime_sec = playtime_sec + excluded.playtime_sec,
@@ -152,27 +230,38 @@ reportRoutes.post("/match-report", async (c) => {
          eliminations = eliminations + excluded.eliminations,
          times_eliminated = times_eliminated + excluded.times_eliminated,
          tags = tags + excluded.tags,
+         builder = builder + excluded.builder,
          updated_at = excluded.updated_at`)
-      .bind(userId, xpGain, report.durationSec, stats.won ? 1 : 0,
-        stats.elims, p.timesElim | 0, stats.tags, now));
+      .bind(userId, userId, report.matchId, report.durationSec, stats.won ? 1 : 0,
+        stats.elims, p.timesElim, stats.tags, stats.builder, now, report.matchId, processingToken));
     grantedUsers.push(userId);
   }
 
-  if (stmts.length > 0) {
-    await c.env.DB.batch(stmts);
-  }
+  stmts.push(c.env.DB.prepare(
+    `UPDATE matches SET processed_at = ?, processing_token = NULL
+     WHERE match_id = ? AND processing_token = ? AND processed_at IS NULL`)
+    .bind(now, report.matchId, processingToken));
 
-  // Second pass: recompute levels + evaluate data-driven unlocks for the granted users.
+  const results = await c.env.DB.batch(stmts);
+  const owned = (results[0]?.meta?.changes ?? 0) > 0 || (results[1]?.meta?.changes ?? 0) > 0;
+  if (!owned) return c.json({ ok: true, duplicate: true });
+
+  // The ledger and projection are already committed atomically. Level/unlock projections are
+  // rebuildable; log a failure without causing a retry to misreport the committed match as failed.
   for (const userId of grantedUsers) {
-    const prof = await c.env.DB.prepare(
-      "SELECT xp_total, level FROM app_profiles WHERE user_id = ?").bind(userId).first();
-    if (!prof) continue;
-    const newLevel = levelForXp(prof.xp_total as number);
-    if (newLevel !== prof.level) {
-      await c.env.DB.prepare("UPDATE app_profiles SET level = ? WHERE user_id = ?")
-        .bind(newLevel, userId).run();
+    try {
+      const prof = await c.env.DB.prepare(
+        "SELECT xp_total, level FROM app_profiles WHERE user_id = ?").bind(userId).first();
+      if (!prof) continue;
+      const newLevel = levelForXp(prof.xp_total as number);
+      if (newLevel !== prof.level) {
+        await c.env.DB.prepare("UPDATE app_profiles SET level = ? WHERE user_id = ?")
+          .bind(newLevel, userId).run();
+      }
+      await evaluateUnlocks(c.env, userId);
+    } catch (error) {
+      console.error("post-match projection failed", { userId, error: String(error) });
     }
-    await evaluateUnlocks(c.env, userId);
   }
 
   return c.json({ ok: true, granted: grantedUsers.length });
