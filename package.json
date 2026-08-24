@@ -9,7 +9,12 @@
     "schema:local": "wrangler d1 execute combatforge_api --local --file=./sql/schema.sql && wrangler d1 execute combatforge_api --local --file=./sql/auth-schema.sql && wrangler d1 execute combatforge_api --local --file=./sql/seed.sql",
     "schema:remote": "wrangler d1 execute combatforge_api --remote --file=./sql/schema.sql && wrangler d1 execute combatforge_api --remote --file=./sql/auth-schema.sql && wrangler d1 execute combatforge_api --remote --file=./sql/seed.sql",
     "migrate:epic:remote": "wrangler d1 migrations apply combatforge_api --remote",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "ci:schema": "node scripts/ci-schema.mjs",
+    "ci:routes": "node scripts/run-ci-routes.mjs",
+    "ci:worker": "bash scripts/ci-worker-smoke.sh",
+    "smoke": "node scripts/smoke.mjs",
+    "test": "npm run typecheck && npm run ci:schema && npm run ci:routes"
   },
   "dependencies": {
     "better-auth": "^1.6.11",
@@ -21,6 +26,7 @@
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260714.1",
     "better-sqlite3": "^12.11.1",
+    "esbuild": "^0.28.1",
     "typescript": "^5.6.0",
     "wrangler": "^4.114.0"
   }

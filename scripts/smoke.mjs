@@ -53,7 +53,7 @@ async function main() {
     const r = await j(await fetch(`${BASE}/v1/servers/register`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${serverKey}` },
-      body: JSON.stringify({ port: 7777, netProtocol: 4, map: "WAREHOUSE", mode: "Skirmish", maxPlayers: 12 }),
+      body: JSON.stringify({ port: 7777, netProtocol: 20, map: "WAREHOUSE", mode: "Skirmish", maxPlayers: 12 }),
     }));
     check("server register", r.status === 200 && r.body.ok, JSON.stringify(r.body));
     const hb = await j(await fetch(`${BASE}/v1/servers/heartbeat`, {
@@ -154,7 +154,7 @@ async function main() {
     const servers = await j(await fetch(`${BASE}/v1/servers`, { headers: gameHeaders }));
     check("server browser list", servers.status === 200 && servers.body.servers?.length >= 1,
       JSON.stringify(servers.body));
-    const qp = await j(await fetch(`${BASE}/v1/quickplay?netProtocol=4`, { headers: gameHeaders }));
+    const qp = await j(await fetch(`${BASE}/v1/quickplay?netProtocol=20`, { headers: gameHeaders }));
     check("quickplay finds the server", qp.status === 200 && qp.body.server?.port === 7777,
       JSON.stringify(qp.body));
     const guid = "a".repeat(40);
@@ -174,7 +174,7 @@ async function main() {
   {
     const report = {
       matchId: "smoke-" + Date.now(), mode: "Skirmish", map: "WAREHOUSE",
-      endedAt: Math.floor(Date.now() / 1000), durationSec: 700, winnerTeam: 0, netProtocol: 4,
+      endedAt: Math.floor(Date.now() / 1000), durationSec: 700, winnerTeam: 0, netProtocol: 20,
       players: [
         { guidHash: "a".repeat(40), team: 0, elims: 7, timesElim: 3, score: 9, tags: 7,
           objective: 2, builder: 12, completed: true },

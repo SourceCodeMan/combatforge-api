@@ -141,6 +141,20 @@ storeRoutes.post("/promo/redeem", async (c) => {
     return c.json({ error: "code expired" }, 410);
   }
   const entitlementId = promo.entitlement_id as string;
+  // Preserve the endpoint's idempotent retry contract: a user retrying this exact code should be
+  // distinguishable from a user who already owns the entitlement through a purchase/admin grant.
+  // The equivalent check after the batch is still required to arbitrate concurrent first retries.
+  const priorRedemption = await c.env.DB.prepare(
+    `SELECT entitlement_id FROM promo_redemptions WHERE code = ? AND user_id = ?`)
+    .bind(code, userId).first();
+  if (priorRedemption) {
+    return c.json({
+      ok: true,
+      entitlement: priorRedemption.entitlement_id,
+      alreadyRedeemed: true,
+      unlocksGranted: 0,
+    });
+  }
   const owned = await c.env.DB.prepare(
     `SELECT 1 FROM entitlements WHERE user_id = ? AND entitlement_id = ?`)
     .bind(userId, entitlementId).first();
