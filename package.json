@@ -10,7 +10,7 @@
     "schema:remote": "wrangler d1 execute combatforge_api --remote --file=./sql/schema.sql && wrangler d1 execute combatforge_api --remote --file=./sql/auth-schema.sql && wrangler d1 execute combatforge_api --remote --file=./sql/seed.sql"
   },
   "dependencies": {
-    "better-auth": "^1.6.11",
+    "better-auth": "^1.7.7",
     "hono": "^4.6.0",
     "kysely": "^0.27.0",
     "kysely-d1": "^0.3.0",
